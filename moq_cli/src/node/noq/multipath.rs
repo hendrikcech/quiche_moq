@@ -264,7 +264,8 @@ mod tests {
                 remote,
             }),
         };
-        let request = ConnectRequest::new(format!("https://127.0.0.1:{port}").parse().unwrap());
+        let request =
+            ConnectRequest::new(url::Url::parse(&format!("https://127.0.0.1:{port}")).unwrap());
         let (client, server) = tokio::time::timeout(Duration::from_secs(10), async {
             let client = connect(request, options, true).await.unwrap();
             (client, server.await.unwrap())
