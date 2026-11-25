@@ -4,7 +4,7 @@ From the repository root on Linux with network namespace support, point Nix at
 a checkout of the **noq scheduler fork** (with the MinRTT and BLEST APIs):
 
 ```sh
-noq_src="git+file:$(realpath ../noq)?ref=feat/multipath-blest-ecf-saecf"
+noq_src="git+file:$(realpath ../noq)"
 nix run ./moq_cli/nixnet#mpquic-min-rtt --override-input moq/noq-src "$noq_src"
 nix run ./moq_cli/nixnet#mpquic-blest --override-input moq/noq-src "$noq_src"
 ```
