@@ -3,6 +3,7 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-parts.url = "github:hercules-ci/flake-parts";
     nixnet.url = "github:birneee/nixnet";
+    moq.url = "path:../..";
   };
   outputs =
     inputs@{ flake-parts, ... }:
@@ -15,26 +16,15 @@
         { pkgs, inputs', ... }:
         let
           nixnet = inputs'.nixnet.legacyPackages;
-          fontsConf = pkgs.makeFontsConf { fontDirectories = with pkgs; [ noto-fonts ]; };
-          tosVideo = pkgs.fetchurl {
-            url = "https://ftp.nluug.nl/pub/graphics/blender/demo/movies/ToS/ToS-4k-1920.mov";
-            hash = "sha256-vStbxsFtQIUDT0fvfks5OK/oa07sSsPPJoU2fTsLI7A=";
-          };
           config = {
+            name = "moq-quiche";
             nodePackages = with pkgs; [
-              (nixnet.linkFarm "host-tools" [
-                {
-                  name = "bin/moq";
-                  path = nixnet.hostBind "/home/benedikt/Git/quiche_moq/target/release/moq";
-                }
-              ])
+              inputs'.moq.packages.moq-cli
               coreutils
               ffmpeg
             ];
             nodes = {
               client = {
-                shareWayland = true;
-                sharePipeWire = true;
                 networking.interfaces.veth1.ipv4.addresses = [
                   {
                     address = "1.0.0.1";
@@ -43,13 +33,14 @@
                 ];
                 scripts.main = {
                   exec = ''
-                    trap 'kill $(jobs -p) 2>/dev/null' EXIT
                     mkfifo /tmp/sv.mp4 /tmp/sa.mp4
-                    sleep 1
                     moq --connect https://1.0.0.2 \
                       --sub "tos--video#out=/tmp/sv.mp4&filter=next-group-start" \
                       --sub "tos--audio#out=/tmp/sa.mp4&filter=next-group-start" &
-                    ffmpeg -nostdin -v error -xerror -i /tmp/sv.mp4 -i /tmp/sa.mp4 -c copy -f matroska - | FONTCONFIG_FILE=${fontsConf} ffplay -v error -autoexit -
+                    trap 'kill "$!" 2>/dev/null || true' EXIT
+                    timeout 30s ffmpeg -nostdin -v error -xerror -abort_on empty_output_stream \
+                      -i /tmp/sv.mp4 -i /tmp/sa.mp4 -map 0:v -map 1:a -t 2 -f null -
+                    echo "Decoded audio and video through the MoQ relay"
                   '';
                   await = true;
                 };
@@ -73,6 +64,7 @@
                   exec = ''
                     moq \
                     --listen 443 \
+                    --connect 'https://2.0.0.2#upstream' \
                     --sub-passive "*" \
                     --pub-passive "*" \
                     --cache-max-obj 1048576 \
@@ -91,11 +83,14 @@
                 scripts.main = {
                   exec = ''
                     mkfifo /tmp/pv.mp4 /tmp/pa.mp4
-                    ffmpeg -nostdin -y -v error -xerror -re -i ${tosVideo} \
-                      -map 0:v -c:v copy -movflags empty_moov+default_base_moof -frag_duration 1 -f mp4 /tmp/pv.mp4 \
-                      -map 0:a -c:a copy -movflags empty_moov+default_base_moof -frag_duration 1 -f mp4 /tmp/pa.mp4 &
-                    sleep 0.1
-                    moq --connect https://2.0.0.1 \
+                    ffmpeg -nostdin -y -v error -xerror \
+                      -re -f lavfi -i testsrc2=size=320x180:rate=25 \
+                      -re -f lavfi -i sine=frequency=440 \
+                      -map 0:v -c:v libx264 -preset ultrafast -g 25 -threads 1 \
+                      -movflags empty_moov+default_base_moof+frag_keyframe -f mp4 /tmp/pv.mp4 \
+                      -map 1:a -c:a aac -movflags empty_moov+default_base_moof \
+                      -frag_duration 1000000 -f mp4 /tmp/pa.mp4 &
+                    moq --listen 443 \
                       --pub tos \
                       --pub-passive "tos--video#in=/tmp/pv.mp4" \
                       --pub-passive "tos--audio#in=/tmp/pa.mp4"
