@@ -24,6 +24,10 @@ quiche_mio_runner = { workspace = true }
 quiche_moq = { workspace = true, features = ["qlog"] }
 moq_core = { workspace = true }
 moq_wire = { workspace = true }
+moq_core = { workspace = true }
+moq_core_async = { workspace = true }
+moq_noq = { path = "../moq_noq" }
+tokio = { workspace = true, features = ["signal"] }
 quiche_moq_webtransport_helper = { workspace = true }
 quiche_endpoint_utils = { workspace = true }
 quiche_utils = { workspace = true }
