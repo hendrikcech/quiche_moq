@@ -12,6 +12,10 @@ keywords = ["moq", "quic", "media", "streaming", "webtransport"]
 name = "moq"
 path = "src/main.rs"
 
+[features]
+# Requires patching noq and noq-proto to the scheduler fork; see README.md.
+multipath = ["dep:noq-proto", "dep:rustls-platform-verifier"]
+
 [dependencies]
 clap = { workspace = true }
 env_logger = { workspace = true }
@@ -26,6 +30,8 @@ moq_core = { workspace = true }
 moq_wire = { workspace = true }
 moq_core_async = { workspace = true }
 moq_noq = { path = "../moq_noq" }
+noq-proto = { version = "1", optional = true, default-features = false }
+rustls-platform-verifier = { version = "0.7", optional = true }
 tokio = { workspace = true, features = ["signal"] }
 quiche_moq_webtransport_helper = { workspace = true }
 quiche_endpoint_utils = { workspace = true }

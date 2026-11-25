@@ -8,9 +8,14 @@ use moq_noq::{ConnectParams, NoqTransport};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::task::JoinSet;
 
+#[cfg(feature = "multipath")]
+mod multipath;
+
 type AnyError = Box<dyn std::error::Error>;
 
 pub(super) fn run(args: Args) -> Result<(), AnyError> {
+    #[cfg(feature = "multipath")]
+    multipath::validate(&args)?;
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
@@ -32,9 +37,16 @@ async fn run_async(args: Args) -> Result<(), AnyError> {
     let mut server = if let Some(listen) = &args.listen {
         let (cert, key) = load_or_generate_keys(&args.cert, &args.key);
         let key = PrivatePkcs8KeyDer::from(key.private_key_to_der_pkcs8()?);
-        let server = ServerBuilder::new()
-            .with_addr(([0, 0, 0, 0], listen.port).into())
-            .with_certificate(vec![cert.to_der()?.into()], key.into())?;
+        let addr = ([0, 0, 0, 0], listen.port).into();
+        let chain = vec![cert.to_der()?.into()];
+        #[cfg(feature = "multipath")]
+        let server = if args.mpquic.multipath {
+            multipath::listen(addr, chain, key.into())?
+        } else {
+            ServerBuilder::new().with_addr(addr).with_certificate(chain, key.into())?
+        };
+        #[cfg(not(feature = "multipath"))]
+        let server = ServerBuilder::new().with_addr(addr).with_certificate(chain, key.into())?;
         info!("listening on {}", server.local_addr()?);
         Some(server)
     } else {
@@ -43,12 +55,18 @@ async fn run_async(args: Args) -> Result<(), AnyError> {
     let mut connects = JoinSet::new();
     let mut next_id = 0;
     if !args.connect.is_empty() {
-        let builder = ClientBuilder::new();
-        let client = if args.noq_insecure {
-            builder.dangerous().with_no_certificate_verification()?
-        } else {
-            builder.with_system_roots()?
-        };
+        #[cfg(not(feature = "multipath"))]
+        let use_default_client = true;
+        #[cfg(feature = "multipath")]
+        let use_default_client = !args.mpquic.multipath;
+        let client = use_default_client.then(|| {
+            let builder = ClientBuilder::new();
+            if args.noq_insecure {
+                builder.dangerous().with_no_certificate_verification()
+            } else {
+                builder.with_system_roots()
+            }
+        }).transpose()?;
         for target in &args.connect {
             let mut request = proto::ConnectRequest::new(Url::parse(&target.url)?);
             if let Some(protocol) = &protocol {
@@ -57,8 +75,21 @@ async fn run_async(args: Args) -> Result<(), AnyError> {
             let cid = next_id;
             next_id += 1;
             let upstream = target.upstream;
-            let client = client.clone();
-            connects.spawn(async move { (cid, upstream, client.connect(request).await) });
+            #[cfg(feature = "multipath")]
+            if args.mpquic.multipath {
+                let options = args.mpquic.clone();
+                let insecure = args.noq_insecure;
+                connects.spawn(async move {
+                    let result = multipath::connect(request, options, insecure).await;
+                    (cid, upstream, result.map_err(|error| error.to_string()))
+                });
+                continue;
+            }
+            let client = client.clone().expect("the standard backend built a client");
+            connects.spawn(async move {
+                let result = client.connect(request).await;
+                (cid, upstream, result.map_err(|error| error.to_string()))
+            });
         }
     }
 
@@ -89,6 +120,10 @@ async fn run_async(args: Args) -> Result<(), AnyError> {
                 }
             }
             Some(request) = accept(&mut server) => {
+                #[cfg(feature = "multipath")]
+                if let Some(scheduler) = args.mpquic.scheduler {
+                    multipath::set_scheduler(request.conn(), scheduler);
+                }
                 match tokio::time::timeout(Duration::from_secs(1), respond(request, protocol.as_deref())).await {
                     Ok(Ok(Some(session))) => {
                         conns.insert(next_id, make_connection(session, true, cfg.clone())?);

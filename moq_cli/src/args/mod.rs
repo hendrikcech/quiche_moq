@@ -18,6 +18,59 @@ pub enum Backend {
     Noq,
 }
 
+#[cfg(feature = "multipath")]
+#[derive(clap::Args, Debug, Clone, Default)]
+pub struct MultipathArgs {
+    /// Enable MPQUIC with --backend noq.
+    #[arg(long, requires = "scheduler")]
+    pub multipath: bool,
+
+    /// Send scheduler for negotiated MPQUIC connections.
+    #[arg(long, value_enum, requires = "multipath")]
+    pub scheduler: Option<Scheduler>,
+
+    /// Bind the primary MPQUIC socket for a single --connect target.
+    #[arg(long, requires_all = ["multipath", "connect"])]
+    pub bind: Option<std::net::SocketAddr>,
+
+    /// Open a second path to the --connect peer, from LOCAL to REMOTE.
+    #[arg(long, value_name = "LOCAL=REMOTE", requires = "bind")]
+    pub additional_path: Option<AdditionalPath>,
+}
+
+#[cfg(feature = "multipath")]
+#[derive(clap::ValueEnum, Debug, Clone, Copy)]
+pub enum Scheduler {
+    MinRtt,
+    Blest,
+}
+
+#[cfg(feature = "multipath")]
+#[derive(Debug, Clone, Copy)]
+pub struct AdditionalPath {
+    pub local: std::net::SocketAddr,
+    pub remote: std::net::SocketAddr,
+}
+
+#[cfg(feature = "multipath")]
+impl FromStr for AdditionalPath {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (local, remote) = value.split_once('=').ok_or("expected LOCAL=REMOTE socket addresses")?;
+        let local: std::net::SocketAddr = local.parse().map_err(|_| "invalid LOCAL socket address")?;
+        let remote: std::net::SocketAddr = remote.parse().map_err(|_| "invalid REMOTE socket address")?;
+        if local.ip().is_unspecified()
+            || remote.ip().is_unspecified()
+            || remote.port() == 0
+            || local.is_ipv4() != remote.is_ipv4()
+        {
+            return Err("path requires concrete addresses of the same IP family and a nonzero remote port".into());
+        }
+        Ok(Self { local, remote })
+    }
+}
+
 /// Unified MoQ node: publish, subscribe, relay, and route tracks over MoQ transport.
 ///
 /// Signals:
@@ -35,6 +88,10 @@ pub struct Args {
     /// Skip server certificate verification with noq (isolated tests only).
     #[arg(long)]
     pub noq_insecure: bool,
+
+    #[cfg(feature = "multipath")]
+    #[command(flatten)]
+    pub mpquic: MultipathArgs,
 
     /// Listen for incoming QUIC connections on this port.
     /// - `#upstream`: fallback `--sub` source when no namespace announced yet;
@@ -467,6 +524,10 @@ impl Args {
         }
         if self.backend == Backend::Quiche && self.noq_insecure {
             return Err("--noq-insecure requires --backend noq".into());
+        }
+        #[cfg(feature = "multipath")]
+        if self.backend != Backend::Noq && self.mpquic.multipath {
+            return Err("--multipath requires --backend noq".into());
         }
         if self.backend == Backend::Noq {
             if self.listen.as_ref().is_some_and(|listen| listen.native)
