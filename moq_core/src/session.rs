@@ -385,8 +385,12 @@ impl MoqTransportSession {
                 // Either the control channel, or (draft 17+ only) a per-request bidi
                 // stream: one we opened (SUBSCRIBE/PUBLISH/PUBLISH_NAMESPACE awaiting a
                 // response) or one the peer just opened with such a request.
-                if self.process_stream_message(stream_id, t, &mut result).is_break() {
-                    return result;
+                loop {
+                    match self.process_stream_message(stream_id, t, &mut result) {
+                        ControlFlow::Break(()) => return result,
+                        ControlFlow::Continue(true) if self.control_channel.has_buffered_bytes(stream_id) => {}
+                        ControlFlow::Continue(_) => break,
+                    }
                 }
             } else {
                 // Non-control (data) stream.
@@ -429,24 +433,23 @@ impl MoqTransportSession {
         result
     }
 
-    /// Reads and dispatches one message from `stream_id` (control channel or, for
-    /// draft 17+, a per-request bidi stream). `ControlFlow::Break` means the
-    /// session was closed and `handle()` must return immediately.
+    /// Reads and dispatches one message. Returns whether it consumed a message,
+    /// or breaks if the session was closed.
     fn process_stream_message(
         &mut self,
         stream_id: u64,
         t: &mut impl Transport,
         result: &mut PollResult,
-    ) -> ControlFlow<()> {
+    ) -> ControlFlow<(), bool> {
         let setup_version = self.selected_version.unwrap_or_else(|| self.config.version_negotiation.preferred());
         let read = self.control_channel.next_message(stream_id, self.selected_version, setup_version, t);
         let cm = match read {
             Ok(v) => v,
             Err(Error::Unimplemented) => {
                 error!("unimplemented");
-                return ControlFlow::Continue(());
+                return ControlFlow::Continue(false);
             }
-            Err(Error::Done) => return ControlFlow::Continue(()),
+            Err(Error::Done) => return ControlFlow::Continue(false),
             Err(Error::Wire(moq_wire::Error::ProtocolViolation(reason))) => {
                 error!("protocol violation, closing session: {reason}");
                 t.close_session(PROTOCOL_VIOLATION as u64, "");
@@ -468,7 +471,7 @@ impl MoqTransportSession {
             }).ok();
         }
         self.dispatch_received_message(stream_id, cm, t, result);
-        ControlFlow::Continue(())
+        ControlFlow::Continue(true)
     }
 
     fn dispatch_received_message(
@@ -1346,4 +1349,71 @@ pub enum NamespacePublishRequestAction {
     Keep,
     Accept,
     Reject(ErrorCode),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{collections::VecDeque, io::Read, result::Result as TransportResult};
+
+    #[derive(Default)]
+    struct ControlPipe {
+        incoming: VecDeque<u8>,
+        outgoing: VecDeque<u8>,
+    }
+
+    impl ControlPipe {
+        fn deliver(&mut self) {
+            assert!(self.incoming.is_empty());
+            self.incoming = std::mem::take(&mut self.outgoing);
+        }
+    }
+
+    impl Transport for ControlPipe {
+        fn recv_stream(&mut self, id: u64, buf: &mut [u8]) -> TransportResult<usize, StreamError> {
+            assert_eq!(id, 0);
+            match self.incoming.read(buf).unwrap() {
+                0 => Err(StreamError::Done),
+                n => Ok(n),
+            }
+        }
+
+        fn send_stream(&mut self, id: u64, buf: &[u8], fin: bool) -> TransportResult<usize, StreamError> {
+            assert_eq!(id, 0);
+            assert!(!fin);
+            self.outgoing.extend(buf);
+            Ok(buf.len())
+        }
+
+        fn send_stream_if_capacity(&mut self, id: u64, buf: &[u8], fin: bool) -> TransportResult<usize, StreamError> {
+            self.send_stream(id, buf, fin)
+        }
+
+        fn open_uni_stream(&mut self) -> TransportResult<u64, StreamError> { unreachable!() }
+        fn open_bidi_stream(&mut self) -> TransportResult<u64, StreamError> { Ok(0) }
+        fn set_stream_priority(&mut self, _: u64, _: u8, _: bool) {}
+        fn reset_stream(&mut self, _: u64, _: u64) { unreachable!() }
+        fn stop_sending(&mut self, _: u64, _: u64) { unreachable!() }
+        fn close_session(&mut self, _: u64, _: &str) { unreachable!() }
+    }
+
+    #[test]
+    fn coalesced_subscriptions_need_only_one_readable_event() {
+        let mut pipe = ControlPipe::default();
+        let mut client = MoqTransportSession::connect(&mut pipe, Config::default()).unwrap();
+        let mut server = MoqTransportSession::accept(Config::default()).unwrap();
+        pipe.deliver();
+        server.handle(&mut pipe, &[0]);
+        server.post_handle(&mut pipe);
+        pipe.deliver();
+        client.handle(&mut pipe, &[0]);
+
+        for track in ["test--video", "test--audio"] {
+            client.subscribe(&track.parse().unwrap(), None, None, FilterType::NextGroupStart, &mut pipe).unwrap();
+        }
+        pipe.deliver();
+        server.handle(&mut pipe, &[0]);
+        assert!(pipe.incoming.is_empty());
+        assert_eq!(server.pending_received_subscriptions().len(), 2);
+    }
 }

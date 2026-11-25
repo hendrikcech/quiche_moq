@@ -297,6 +297,15 @@ impl ControlChannel {
         self.request_stream_request_ids.get(&stream_id).copied()
     }
 
+    /// Bytes already removed from the transport won't produce another readable event.
+    pub(crate) fn has_buffered_bytes(&self, stream_id: u64) -> bool {
+        if self.topology.and_then(|topology| topology.in_id()) == Some(stream_id) {
+            !self.ctrl_buf.buffer().is_empty()
+        } else {
+            self.request_stream_bufs.get(&stream_id).is_some_and(|buf| !buf.buffer().is_empty())
+        }
+    }
+
     /// Reads and decodes the next full message from `stream_id`, buffering
     /// partial reads internally. `selected_version` is `None` before the
     /// handshake completes, in which case the version to decode with is itself
