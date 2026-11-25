@@ -6,6 +6,12 @@ use moq_wire::{Namespace, NamespaceTrackname};
 use std::path::PathBuf;
 use std::str::FromStr;
 
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    Quiche,
+    Noq,
+}
+
 /// Unified MoQ node: publish, subscribe, relay, and route tracks over MoQ transport.
 ///
 /// Signals:
@@ -21,6 +27,14 @@ use std::str::FromStr;
 #[derive(Parser, Debug, Clone)]
 #[command(name = "moq")]
 pub struct Args {
+    /// QUIC/WebTransport implementation to use.
+    #[arg(long, value_enum, default_value = "quiche")]
+    pub backend: Backend,
+
+    /// Skip server certificate verification with noq (isolated tests only).
+    #[arg(long)]
+    pub noq_insecure: bool,
+
     /// Listen for incoming QUIC connections on this port.
     #[arg(long)]
     pub listen: Option<u16>,

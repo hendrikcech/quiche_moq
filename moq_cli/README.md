@@ -46,3 +46,10 @@ $ moq --connect https://127.0.0.1:8080 --sub chat--messages
 From the repo root on Linux, run `nix run ./moq_cli/nixnet`. The experiment
 generates test audio and video, sends them through a MoQ relay, and exits
 after FFmpeg decodes both tracks. No display or media download is needed.
+
+Run `nix run ./moq_cli/nixnet#noq` for the same experiment over the
+experimental noq WebTransport backend. Outside nixnet, use `moq --backend
+noq` with the same publish, subscribe, and relay flags. Clients verify TLS
+against system roots unless `--noq-insecure` is set (used only for the
+experiment's self-signed certificates). Quiche transport tuning, qlog, TLS
+key logging, and QUIC ping flags are not available with noq.

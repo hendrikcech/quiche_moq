@@ -6,6 +6,7 @@ use quiche_moq::wire::{Namespace, NamespaceTrackname, RequestId, TrackAlias};
 use quiche_moq::wire::object::ObjectHeader;
 use quiche_moq_webtransport_helper::MoqWebTransportHelper;
 use quiche_utils::keepalive_handler::KeepaliveHandler;
+use moq_core::{MoqTransportSession, Transport};
 
 /// Per-connection state for an actively-PUBLISHed track (--pub ns--track).
 pub(crate) struct ClientActivePubTrack {
@@ -75,8 +76,35 @@ pub(crate) struct SubTrackTemplate {
 
 pub(crate) struct ConnAppData {
     pub(crate) moq_helper: MoqWebTransportHelper,
-    pub(crate) announced_namespaces: HashMap<Namespace, RequestId>,
-    pub(crate) logged_connect: bool,
+    pub(crate) state: ConnState,
     /// Only set for outbound connections (--connect / --upstream); None for accepted connections.
     pub(crate) keepalive: Option<KeepaliveHandler>,
+}
+
+#[derive(Default)]
+pub(crate) struct ConnState {
+    pub(crate) announced_namespaces: HashMap<Namespace, RequestId>,
+    pub(crate) logged_connect: bool,
+}
+
+pub(crate) struct Connection<S, T, C> {
+    pub(crate) session: S,
+    pub(crate) transport: T,
+    pub(crate) state: C,
+    pub(crate) is_server: bool,
+}
+
+pub(crate) struct MoqHandle<'a, T> {
+    pub(crate) session: &'a mut MoqTransportSession,
+    pub(crate) transport: &'a mut T,
+}
+
+impl<S: std::borrow::BorrowMut<MoqTransportSession>, T: Transport, C> Connection<S, T, C> {
+    pub(crate) fn handle(&mut self) -> MoqHandle<'_, T> {
+        MoqHandle { session: self.session.borrow_mut(), transport: &mut self.transport }
+    }
+
+    pub(crate) fn parts(&mut self) -> (MoqHandle<'_, T>, &mut C) {
+        (MoqHandle { session: self.session.borrow_mut(), transport: &mut self.transport }, &mut self.state)
+    }
 }

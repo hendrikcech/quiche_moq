@@ -16,12 +16,12 @@
         { pkgs, inputs', ... }:
         let
           nixnet = inputs'.nixnet.legacyPackages;
-          config = {
-            name = "moq-quiche";
+          config = backend: {
+            name = "moq-${backend}";
             nodePackages = with pkgs; [
               inputs'.moq.packages.moq-cli
               coreutils
-              ffmpeg
+              ffmpeg-headless
             ];
             nodes = {
               client = {
@@ -34,7 +34,8 @@
                 scripts.main = {
                   exec = ''
                     mkfifo /tmp/sv.mp4 /tmp/sa.mp4
-                    moq --connect https://1.0.0.2 \
+                    moq --backend ${backend} ${pkgs.lib.optionalString (backend == "noq") "--noq-insecure"} \
+                      --connect https://1.0.0.2 \
                       --sub "tos--video#out=/tmp/sv.mp4&filter=next-group-start" \
                       --sub "tos--audio#out=/tmp/sa.mp4&filter=next-group-start" &
                     trap 'kill "$!" 2>/dev/null || true' EXIT
@@ -62,7 +63,7 @@
                 };
                 scripts.main = {
                   exec = ''
-                    moq \
+                    moq --backend ${backend} ${pkgs.lib.optionalString (backend == "noq") "--noq-insecure"} \
                     --listen 443 \
                     --connect 'https://2.0.0.2#upstream' \
                     --sub-passive "*" \
@@ -90,7 +91,7 @@
                       -movflags empty_moov+default_base_moof+frag_keyframe -f mp4 /tmp/pv.mp4 \
                       -map 1:a -c:a aac -movflags empty_moov+default_base_moof \
                       -frag_duration 1000000 -f mp4 /tmp/pa.mp4 &
-                    moq --listen 443 \
+                    moq --backend ${backend} --listen 443 \
                       --pub tos \
                       --pub-passive "tos--video#in=/tmp/pv.mp4" \
                       --pub-passive "tos--audio#in=/tmp/pa.mp4"
@@ -113,9 +114,10 @@
           };
         in
         {
-          packages.default = nixnet.mkExperiment config;
-          packages.mermaid = nixnet.mkMermaid config;
-          packages.mermaid-svg = nixnet.mkMermaidSvg config;
+          packages.default = nixnet.mkExperiment (config "quiche");
+          packages.noq = nixnet.mkExperiment (config "noq");
+          packages.mermaid = nixnet.mkMermaid (config "quiche");
+          packages.mermaid-svg = nixnet.mkMermaidSvg (config "quiche");
         };
     };
 }

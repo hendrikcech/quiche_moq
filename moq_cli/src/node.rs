@@ -1,4 +1,5 @@
-use std::collections::{HashMap, HashSet};
+use std::borrow::BorrowMut;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::time::{Duration, Instant};
@@ -9,11 +10,13 @@ use mio::Interest;
 use url::Url;
 
 use moq_loc::{LocProperties, Timestamp};
+use moq_core::{MoqTransportSession, Transport};
+use moq_core::Error as MoqError;
 use moq_object_cache::{CachedObjectRef, ObjectCache, PackedObjectCache};
 use quiche_endpoint_utils::SignalSource;
 use quiche_mio_runner as runner;
 use quiche_mio_runner::quiche_endpoint::{
-    ClientId, ConnMap, Endpoint, EndpointConfig, ServerConfig, make_qlog_writer, quiche,
+    ClientId, Endpoint, EndpointConfig, ServerConfig, make_qlog_writer, quiche,
 };
 use quiche_mio_runner::Socket;
 use quiche_moq as moq;
@@ -23,19 +26,22 @@ use quiche_moq::wire::{
     REQUEST_ERROR_UNINTERESTED, RequestId, version_to_name,
 };
 use quiche_moq::{NamespacePublishRequestAction, PublishRequestAction, SubscriptionRequestAction};
-use quiche_moq_webtransport_helper::{MoqHandle, MoqWebTransportHelper};
+use quiche_moq_webtransport_helper::MoqWebTransportHelper;
 use quiche_utils::cert::load_or_generate_keys;
 use quiche_utils::keepalive_handler::KeepaliveHandler;
 
-use crate::conn::{ClientActivePubTrack, ClientSubTrack, ConnAppData, SubTrackTemplate};
+use crate::conn::{ClientActivePubTrack, ClientSubTrack, ConnAppData, ConnState, Connection, MoqHandle, SubTrackTemplate};
 use crate::file_output::FileOutputState;
 use crate::local_track::{is_video_fourcc, FileInputState, LocalAliasState, LocalTrack, PendingInboundSubscription};
 use crate::relay::{RelayPublisherInfo, RelaySubscriberInfo, RelaySubscription, aggregate_delivery_timeout};
 use crate::{Args, PubTarget, TrackPattern};
 
+mod noq;
+
 // ── type alias ────────────────────────────────────────────────────────────────
 
 type Runner = runner::Runner<ConnAppData, AppData, i32>;
+type Connections<S, T, C> = BTreeMap<ClientId, Connection<S, T, C>>;
 
 /// Sentinel external-event value for the SIGINT/SIGTERM signal source.
 /// Real file descriptors registered via `register_external` are always >= 0.
@@ -49,7 +55,7 @@ const USR1_EVENT: i32 = -2;
 /// `LocalTrack` entry if needed and registers the new alias so Phase 5
 /// forwards cached objects to it.
 fn accept_local_subscription(
-    moq: &mut MoqHandle, ad: &mut AppData, cid: ClientId,
+    moq: &mut MoqHandle<'_, impl Transport>, ad: &mut AppData, cid: ClientId,
     request_id: RequestId, nt: &NamespaceTrackname, filter: FilterType, priority: u8,
     delivery_timeout: Option<u64>,
 ) {
@@ -63,8 +69,8 @@ fn accept_local_subscription(
     // elapsed for the latest cached object — avoids immediately serving an object that
     // would be rejected as ObjectExpired by the session at send time.
     let last_sent = local.start_location_for_filter_with_dt(filter, delivery_timeout);
-    let alias = moq.accept_subscription(request_id, largest, None);
-    moq.set_out_track_priority(alias, priority, false);
+    let alias = moq.session.accept_subscription(request_id, largest, None, moq.transport);
+    moq.session.set_out_track_priority(alias, priority, false, moq.transport);
     local.aliases.push(LocalAliasState { conn_id: cid, alias, last_sent, remaining: 0 });
     info!("conn {cid} accept subscription {nt}");
 }
@@ -142,9 +148,16 @@ impl AppData {
 
 // ── entry point ───────────────────────────────────────────────────────────────
 
-pub fn run(args: Args) {
+pub fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+    if args.backend == crate::args::Backend::Noq {
+        return noq::run(args);
+    }
+    if args.noq_insecure {
+        return Err("--noq-insecure requires --backend noq".into());
+    }
     let r = build_runner(&args);
     finish_run(r);
+    Ok(())
 }
 
 /// Builds the fully-configured `Runner` for `args`: opens local track files,
@@ -159,6 +172,83 @@ fn build_runner(args: &Args) -> Runner {
 
     if let Some(port) = args.listen { info!("listening on 0.0.0.0:{port}"); }
 
+    let (app_data, file_input_fds, file_output_fds) = build_app_data(args);
+    let endpoint = Endpoint::new(
+        args.listen.map(|_| {
+            let (cert, key) = load_or_generate_keys(&args.cert, &args.key);
+            let moq_cfg = make_moq_config(args);
+            let mut c = ServerConfig::new(move |_| ConnAppData {
+                moq_helper: MoqWebTransportHelper::new_server(moq_cfg.clone()),
+                state: ConnState::default(),
+                keepalive: None,
+            });
+            c.client_config = {
+                let mut cfg = quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, {
+                    let mut b = SslContextBuilder::new(SslMethod::tls()).unwrap();
+                    b.set_private_key(&key).unwrap();
+                    b.set_certificate(&cert).unwrap();
+                    b
+                }).unwrap();
+                MoqWebTransportHelper::configure_quic(&mut cfg);
+                cfg.set_max_idle_timeout(args.timeout);
+                if let Some(packets) = args.listen_init_cwnd() { cfg.set_initial_congestion_window_packets(packets); }
+                if let Some(v) = args.listen_max_data() { cfg.set_initial_max_data(v); }
+                if let Some(v) = args.listen_max_stream_data() {
+                    cfg.set_initial_max_stream_data_bidi_remote(v);
+                    cfg.set_initial_max_stream_data_bidi_local(v);
+                    cfg.set_initial_max_stream_data_uni(v);
+                }
+                if let Some(v) = args.listen_max_streams_uni() { cfg.set_initial_max_streams_uni(v); }
+                if let Some(v) = args.listen_max_streams_bidi() { cfg.set_initial_max_streams_bidi(v); }
+                cfg
+            };
+            c
+        }),
+        { let mut c = EndpointConfig::default(); c.setup_qlog = setup_qlog; c },
+        app_data,
+    );
+
+    let mut r = Runner::new(
+        { let mut c = runner::Config::<ConnAppData, AppData, i32>::default();
+          c.post_handle_recvs = post_handle_recvs;
+          c.on_external_event = Some(on_file_event);
+          c },
+        endpoint,
+    );
+
+    for conn in &args.connect {
+        let cid = connect_outbound(&mut r, args, local_addr, &conn.url);
+        register_outbound(r.endpoint.app_data_mut(), cid, conn);
+    }
+
+    for fd in &file_input_fds {
+        r.registry().register_external(&mut mio::unix::SourceFd(fd), Interest::READABLE, *fd);
+    }
+    for fd in &file_output_fds {
+        r.registry().register_external(&mut mio::unix::SourceFd(fd), Interest::WRITABLE, *fd);
+    }
+    if let Some(sock) = server_socket { r.register_socket(sock); }
+    if let Some(sock) = client_socket { r.register_socket(sock); }
+    r.registry().register_external_owned(SignalSource::new(&[libc::SIGINT, libc::SIGTERM]), Interest::READABLE, SHUTDOWN_EVENT);
+    let mut sigusr1 = SignalSource::new(&[libc::SIGUSR1]);
+    r.registry().register_external(&mut sigusr1, Interest::READABLE, USR1_EVENT);
+    r.endpoint.app_data_mut().sigusr1_source = Some(sigusr1);
+    r
+}
+
+fn register_outbound(ad: &mut AppData, cid: ClientId, conn: &crate::args::ConnectArg) {
+    if conn.upstream {
+        info!("connecting to upstream {}", conn.url);
+        ad.upstream_cid = Some(cid);
+    } else {
+        info!("connecting to {}", conn.url);
+        ad.client_sub_tracks.insert(cid, ad.sub_track_templates.iter().map(ClientSubTrack::from_template).collect());
+    }
+}
+
+fn build_app_data(args: &Args) -> (AppData, Vec<RawFd>, Vec<RawFd>) {
+    assert!(args.connect.iter().filter(|c| c.upstream).count() <= 1,
+        "at most one --connect target may be marked #upstream");
     let mut local_tracks: HashMap<NamespaceTrackname, LocalTrack> = HashMap::new();
     let mut local_namespaces: HashSet<Namespace> = HashSet::new();
     let mut active_pub_tracks: Vec<NamespaceTrackname> = Vec::new();
@@ -232,39 +322,7 @@ fn build_runner(args: &Args) -> Runner {
         track.file_outputs.push(FileOutputState::new(file, sub_arg.output_kind.clone()));
     }
 
-    let endpoint = Endpoint::new(
-        args.listen.map(|_| {
-            let (cert, key) = load_or_generate_keys(&args.cert, &args.key);
-            let moq_cfg = make_moq_config(args);
-            let mut c = ServerConfig::new(move |_| ConnAppData {
-                moq_helper: MoqWebTransportHelper::new_server(moq_cfg.clone()),
-                announced_namespaces: HashMap::new(),
-                logged_connect: false,
-                keepalive: None,
-            });
-            c.client_config = {
-                let mut cfg = quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, {
-                    let mut b = SslContextBuilder::new(SslMethod::tls()).unwrap();
-                    b.set_private_key(&key).unwrap();
-                    b.set_certificate(&cert).unwrap();
-                    b
-                }).unwrap();
-                MoqWebTransportHelper::configure_quic(&mut cfg);
-                cfg.set_max_idle_timeout(args.timeout);
-                if let Some(packets) = args.listen_init_cwnd() { cfg.set_initial_congestion_window_packets(packets); }
-                if let Some(v) = args.listen_max_data() { cfg.set_initial_max_data(v); }
-                if let Some(v) = args.listen_max_stream_data() {
-                    cfg.set_initial_max_stream_data_bidi_remote(v);
-                    cfg.set_initial_max_stream_data_bidi_local(v);
-                    cfg.set_initial_max_stream_data_uni(v);
-                }
-                if let Some(v) = args.listen_max_streams_uni() { cfg.set_initial_max_streams_uni(v); }
-                if let Some(v) = args.listen_max_streams_bidi() { cfg.set_initial_max_streams_bidi(v); }
-                cfg
-            };
-            c
-        }),
-        { let mut c = EndpointConfig::default(); c.setup_qlog = setup_qlog; c },
+    (
         AppData {
             pub_passive_wildcards,
             sub_passive_wildcards,
@@ -294,44 +352,9 @@ fn build_runner(args: &Args) -> Runner {
             embed_timestamps: args.timestamp,
             qlog_dir: args.qlog_dir.clone(),
         },
-    );
-
-    let mut r = Runner::new(
-        { let mut c = runner::Config::<ConnAppData, AppData, i32>::default();
-          c.post_handle_recvs = post_handle_recvs;
-          c.on_external_event = Some(on_file_event);
-          c },
-        endpoint,
-    );
-
-    assert!(args.connect.iter().filter(|c| c.upstream).count() <= 1,
-        "at most one --connect target may be marked #upstream");
-
-    for conn in &args.connect {
-        let cid = connect_outbound(&mut r, args, local_addr, &conn.url);
-        if conn.upstream {
-            info!("connecting to upstream {}", conn.url);
-            r.endpoint.app_data_mut().upstream_cid = Some(cid);
-        } else {
-            info!("connecting to {}", conn.url);
-            let ad = r.endpoint.app_data_mut();
-            ad.client_sub_tracks.insert(cid, ad.sub_track_templates.iter().map(ClientSubTrack::from_template).collect());
-        }
-    }
-
-    for fd in &file_input_fds {
-        r.registry().register_external(&mut mio::unix::SourceFd(fd), Interest::READABLE, *fd);
-    }
-    for fd in &file_output_fds {
-        r.registry().register_external(&mut mio::unix::SourceFd(fd), Interest::WRITABLE, *fd);
-    }
-    if let Some(sock) = server_socket { r.register_socket(sock); }
-    if let Some(sock) = client_socket { r.register_socket(sock); }
-    r.registry().register_external_owned(SignalSource::new(&[libc::SIGINT, libc::SIGTERM]), Interest::READABLE, SHUTDOWN_EVENT);
-    let mut sigusr1 = SignalSource::new(&[libc::SIGUSR1]);
-    r.registry().register_external(&mut sigusr1, Interest::READABLE, USR1_EVENT);
-    r.endpoint.app_data_mut().sigusr1_source = Some(sigusr1);
-    r
+        file_input_fds,
+        file_output_fds,
+    )
 }
 
 fn finish_run(mut r: Runner) {
@@ -469,8 +492,7 @@ fn connect_outbound(r: &mut Runner, args: &Args, local_addr: std::net::SocketAdd
     let cid = r.endpoint.connect(None, local_addr, peer_addr, &mut cfg,
         ConnAppData { 
             moq_helper: MoqWebTransportHelper::new_client(url.clone(), make_moq_config(args)),
-            announced_namespaces: HashMap::new(), 
-            logged_connect: false,
+            state: ConnState::default(),
             keepalive: make_keepalive(args),
         },
         None, None);
@@ -518,8 +540,11 @@ fn on_file_event(endpoint: &mut Endpoint<ConnAppData, AppData>, fd: &i32) {
         ad.usr1_requested = true;
         return;
     }
-    let ad = endpoint.app_data_mut();
-    let Some(idx) = ad.file_inputs.iter().position(|i| i.file.as_raw_fd() == *fd) else {
+    drain_file_event(endpoint.app_data_mut(), *fd);
+}
+
+fn drain_file_event(ad: &mut AppData, fd: RawFd) {
+    let Some(idx) = ad.file_inputs.iter().position(|i| i.file.as_raw_fd() == fd) else {
         // Writable event on an output fd — drain buffers
         for track in ad.local_tracks.values_mut() {
             let cache = &track.cache;
@@ -596,36 +621,50 @@ fn post_handle_recvs(r: &mut Runner) {
         info!("sent ping on all connections (SIGUSR1)");
     }
 
-    // cleanup_closed_conns
+    let mut ready = Connections::new();
     let (conns, ad) = r.endpoint.mut_conns_and_app_data();
     for (cid, conn) in conns.iter_mut() {
-        if !conn.conn.is_closed() { continue; }
-        info!("conn {cid} disconnected");
-        ad.namespaces.retain(|_, owner| *owner != cid);
-        for sub in ad.relay_subscriptions.values_mut() {
-            if sub.publisher.as_ref().is_some_and(|p| p.client_id == cid) {
-                sub.publisher = None;
-                for s in &mut sub.subscribers { s.publisher_gone = true; }
-            }
-            sub.subscribers.retain(|s| s.client_id != cid);
+        if conn.conn.is_closed() {
+            disconnect(ad, cid);
+            continue;
         }
-        for track in ad.local_tracks.values_mut() { track.aliases.retain(|a| a.conn_id != cid); }
-        ad.client_sub_tracks.remove(&cid);
-        if ad.upstream_cid == Some(cid) { ad.upstream_cid = None; }
-    }
-
-    // tick_connections
-    let (conns, ad) = r.endpoint.mut_conns_and_app_data();
-    for (cid, conn) in conns.iter_mut() {
         let is_server = conn.conn.is_server();
         conn.app_data.moq_helper.on_post_handle_recvs(&mut conn.conn);
         let Some(moq) = conn.app_data.moq_helper.moq_handle(&mut conn.conn) else { continue };
-        if let Some(v) = moq.version() && !conn.app_data.logged_connect {
+        if let Some(v) = moq.version() && !conn.app_data.state.logged_connect {
             let peer = moq.quic.path_stats().next().map(|s| s.peer_addr).unwrap();
             let verb = if is_server { "accept" } else { "connected to" };
             info!("conn {cid} {verb} {peer} v{}", version_to_name(v));
-            conn.app_data.logged_connect = true;
+            conn.app_data.state.logged_connect = true;
         }
+        let (session, transport) = moq.into_core();
+        ready.insert(cid, Connection { session, transport, state: &mut conn.app_data.state, is_server });
+    }
+    tick(&mut ready, ad, usr1_toggle_padding_stream, &usr1_unpub);
+}
+
+fn disconnect(ad: &mut AppData, cid: ClientId) {
+    info!("conn {cid} disconnected");
+    ad.namespaces.retain(|_, owner| *owner != cid);
+    for sub in ad.relay_subscriptions.values_mut() {
+        if sub.publisher.as_ref().is_some_and(|p| p.client_id == cid) {
+            sub.publisher = None;
+            for s in &mut sub.subscribers { s.publisher_gone = true; }
+        }
+        sub.subscribers.retain(|s| s.client_id != cid);
+    }
+    for track in ad.local_tracks.values_mut() { track.aliases.retain(|a| a.conn_id != cid); }
+    ad.client_sub_tracks.remove(&cid);
+    ad.client_active_pub_tracks.remove(&cid);
+    if ad.upstream_cid == Some(cid) { ad.upstream_cid = None; }
+}
+
+fn tick<S: BorrowMut<MoqTransportSession>, T: Transport, C: BorrowMut<ConnState>>(
+    conns: &mut Connections<S, T, C>, ad: &mut AppData, usr1_toggle_padding_stream: bool, usr1_unpub: &[Namespace],
+) {
+    for (&cid, conn) in conns.iter_mut() {
+        let moq = conn.handle();
+        if !moq.session.initialized() { continue; }
         if Some(cid) == ad.upstream_cid {
             process_upstream_conn(cid, moq, ad);
         } else {
@@ -647,46 +686,44 @@ fn post_handle_recvs(r: &mut Runner) {
     // via `--upstream` or another peer's announcement) are also announced —
     // skipped for the connection that is their source — and un-announced
     // (PUBLISH_NAMESPACE_DONE) once they disappear.
-    let (conns, ad) = r.endpoint.mut_conns_and_app_data();
-    for (cid, conn) in conns.iter_mut() {
-        let Some(mut moq) = conn.app_data.moq_helper.moq_handle(&mut conn.conn) else { continue };
+    for (&cid, conn) in conns.iter_mut() {
+        let (moq, state) = conn.parts();
+        if !moq.session.initialized() { continue; }
+        let announced = &mut state.borrow_mut().announced_namespaces;
         if !ad.relay_namespace.is_empty() {
-            conn.app_data.announced_namespaces.retain(|ns, rid| {
+            announced.retain(|ns, rid| {
                 let still_known = ad.local_namespaces.contains(ns)
                     || ad.namespaces.get(ns).is_some_and(|&owner| owner != cid);
-                if still_known { true } else { moq.publish_namespace_done(*rid); false }
+                if still_known { true } else { moq.session.publish_namespace_done(*rid, moq.transport); false }
             });
         }
         let relay_ns = &ad.relay_namespace;
         let relayed = ad.namespaces.keys().filter(|ns| relay_ns.iter().any(|p| p.matches_namespace(ns)));
         for ns in ad.local_namespaces.iter().chain(relayed) {
             if ad.namespaces.get(ns).is_some_and(|&owner| owner == cid) { continue; }
-            if conn.app_data.announced_namespaces.contains_key(ns) { continue; }
-            if let Ok(rid) = moq.publish_namespace(ns.0.0.clone()) {
-                conn.app_data.announced_namespaces.insert(ns.clone(), rid);
+            if announced.contains_key(ns) { continue; }
+            if let Ok(rid) = moq.session.publish_namespace(ns.0.0.clone(), moq.transport) {
+                announced.insert(ns.clone(), rid);
                 info!("conn {cid} announce namespace {ns}");
             }
         }
     }
 
     // send_active_publishes: PUBLISH (0x1D) to all initialized connections
-    let (conns, ad) = r.endpoint.mut_conns_and_app_data();
     if !ad.active_pub_tracks.is_empty() {
         let (cache_depth, cache_max_obj, cache_avg_obj) = (ad.cache_depth, ad.cache_max_obj, ad.cache_avg_obj);
-        let all_cids: Vec<ClientId> = conns.iter()
-            .map(|(cid, _)| cid)
-            .collect();
+        let all_cids: Vec<ClientId> = conns.keys().copied().collect();
         for cid in all_cids {
             let entry = ad.client_active_pub_tracks.entry(cid).or_default();
             for nt in &ad.active_pub_tracks {
                 if entry.iter().any(|e| &e.track == nt) { continue; }
                 entry.push(ClientActivePubTrack { track: nt.clone(), request_id: None });
             }
-            let Some(mut moq) = moq_handle_for(conns, cid) else { continue };
+            let Some(moq) = moq_handle_for(conns, cid) else { continue };
             let entry = ad.client_active_pub_tracks.get_mut(&cid).unwrap();
             for apt in entry.iter_mut() {
                 if apt.request_id.is_none() {
-                    match moq.publish_track(apt.track.clone(), Parameters(vec![])) {
+                    match moq.session.publish_track(apt.track.clone(), Parameters(vec![]), moq.transport) {
                         Ok((rid, alias)) => {
                             apt.request_id = Some(rid);
                             if !ad.local_tracks.contains_key(&apt.track) {
@@ -700,7 +737,7 @@ fn post_handle_recvs(r: &mut Runner) {
                     }
                 } else {
                     let rid = apt.request_id.unwrap();
-                    if let Some(resp) = moq.poll_publish_response(rid) {
+                    if let Some(resp) = moq.session.poll_publish_response(rid) {
                         match resp {
                             Ok(_) => info!("conn {cid} accepted publish {}", apt.track),
                             Err(e) => error!("conn {cid} rejected publish {}: {e}", apt.track),
@@ -714,10 +751,9 @@ fn post_handle_recvs(r: &mut Runner) {
     // handle_client_connections: accept incoming subscriptions/PUBLISH + sub track draining.
     // client_sub_tracks lives in AppData to avoid split-borrow conflicts.
     // Namespace announcement for these connections is handled by announce_namespaces.
-    let (conns, ad) = r.endpoint.mut_conns_and_app_data();
     let client_cids: Vec<ClientId> = conns.iter()
-        .filter(|(cid, c)| !c.conn.is_server() && Some(*cid) != ad.upstream_cid)
-        .map(|(cid, _)| cid)
+        .filter(|(cid, c)| !c.is_server && Some(**cid) != ad.upstream_cid)
+        .map(|(&cid, _)| cid)
         .collect();
 
     for cid in client_cids {
@@ -729,7 +765,7 @@ fn post_handle_recvs(r: &mut Runner) {
         // collect decisions and return `Keep`, then accept in a second pass
         // below (same split used by `process_server_conn`).
         let mut pending: Vec<PendingInboundSubscription> = Vec::new();
-        moq.process_subscription_requests(|&request_id, sub_msg, _track_alias| {
+        moq.session.process_subscription_requests(|&request_id, sub_msg, _track_alias| {
             pending.push(PendingInboundSubscription {
                 request_id,
                 track: sub_msg.namespace_trackname.clone(),
@@ -738,7 +774,7 @@ fn post_handle_recvs(r: &mut Runner) {
                 delivery_timeout: sub_msg.delivery_timeout(),
             });
             SubscriptionRequestAction::Keep
-        });
+        }, moq.transport);
         for p in pending {
             accept_local_subscription(&mut moq, ad, cid, p.request_id, &p.track, p.filter, p.priority, p.delivery_timeout);
         }
@@ -751,7 +787,6 @@ fn post_handle_recvs(r: &mut Runner) {
     }
 
     // forward_relay_subscriptions
-    let (conns, ad) = r.endpoint.mut_conns_and_app_data();
     let mut unservable: Vec<NamespaceTrackname> = Vec::new();
     for (nt, sub) in ad.relay_subscriptions.iter_mut() {
         let wanted_delivery_timeout = aggregate_delivery_timeout(&sub.subscribers);
@@ -762,8 +797,8 @@ fn post_handle_recvs(r: &mut Runner) {
                 sub.publisher = Some(RelayPublisherInfo { client_id: pub_id, request_id: None, track_alias: None, largest_location: None, delivery_timeout: None, max_cache_duration: None });
             }
             let Some(pub_info) = sub.publisher.as_mut() else { continue };
-            let Some(mut moq) = moq_handle_for(conns, pub_info.client_id) else { continue };
-            if let Ok(rid) = moq.subscribe(nt, None, wanted_delivery_timeout, FilterType::NextGroupStart) {
+            let Some(moq) = moq_handle_for(conns, pub_info.client_id) else { continue };
+            if let Ok(rid) = moq.session.subscribe(nt, None, wanted_delivery_timeout, FilterType::NextGroupStart, moq.transport) {
                 pub_info.request_id = Some(rid);
                 pub_info.delivery_timeout = wanted_delivery_timeout;
             }
@@ -772,8 +807,8 @@ fn post_handle_recvs(r: &mut Runner) {
             // since the initial SUBSCRIBE: tell upstream the new aggregate.
             let Some(pub_info) = sub.publisher.as_mut() else { continue };
             let Some(rid) = pub_info.request_id else { continue };
-            let Some(mut moq) = moq_handle_for(conns, pub_info.client_id) else { continue };
-            if moq.request_update_delivery_timeout(rid, wanted_delivery_timeout).is_ok() {
+            let Some(moq) = moq_handle_for(conns, pub_info.client_id) else { continue };
+            if moq.session.request_update_delivery_timeout(rid, wanted_delivery_timeout, moq.transport).is_ok() {
                 pub_info.delivery_timeout = wanted_delivery_timeout;
             }
         }
@@ -781,8 +816,8 @@ fn post_handle_recvs(r: &mut Runner) {
         if !sub.is_publisher_accepted() {
             let Some(pub_info) = sub.publisher.as_mut() else { continue };
             let Some(rid) = pub_info.request_id else { continue };
-            let Some(mut moq) = moq_handle_for(conns, pub_info.client_id) else { continue };
-            match moq.poll_subscribe_response(rid) {
+            let Some(moq) = moq_handle_for(conns, pub_info.client_id) else { continue };
+            match moq.session.poll_subscribe_response(rid) {
                 Some(Ok((alias, ok_msg))) => {
                     pub_info.track_alias = Some(alias);
                     pub_info.largest_location = ok_msg.largest_location();
@@ -793,8 +828,8 @@ fn post_handle_recvs(r: &mut Runner) {
                     // namespace either: reject everyone waiting on it rather
                     // than leaving them hanging forever.
                     for s in &sub.subscribers {
-                        if let Some(mut moq) = moq_handle_for(conns, s.client_id) {
-                            moq.reject_subscription(s.request_id, REQUEST_ERROR_DOES_NOT_EXIST);
+                        if let Some(moq) = moq_handle_for(conns, s.client_id) {
+                            moq.session.reject_subscription(s.request_id, REQUEST_ERROR_DOES_NOT_EXIST, moq.transport);
                         }
                     }
                     unservable.push(nt.clone());
@@ -809,9 +844,9 @@ fn post_handle_recvs(r: &mut Runner) {
             let max_cache_duration = sub.publisher.as_ref().and_then(|p| p.max_cache_duration);
             for s in &mut sub.subscribers {
                 if s.is_accepted() { continue; }
-                if let Some(mut moq) = moq_handle_for(conns, s.client_id) {
-                    let alias = moq.accept_subscription(s.request_id, largest, max_cache_duration);
-                    moq.set_out_track_priority(alias, s.subscriber_priority, false);
+                if let Some(moq) = moq_handle_for(conns, s.client_id) {
+                    let alias = moq.session.accept_subscription(s.request_id, largest, max_cache_duration, moq.transport);
+                    moq.session.set_out_track_priority(alias, s.subscriber_priority, false, moq.transport);
                     s.track_alias = Some(alias);
                 }
             }
@@ -823,12 +858,11 @@ fn post_handle_recvs(r: &mut Runner) {
     }
 
     // finalize_disconnected_relay_subs: send PUBLISH_DONE to subscribers whose publisher disconnected.
-    let (conns, ad) = r.endpoint.mut_conns_and_app_data();
     for sub in ad.relay_subscriptions.values_mut() {
         sub.subscribers.retain(|s| {
             if !s.publisher_gone { return true; }
-            if let Some(mut moq) = moq_handle_for(conns, s.client_id) {
-                moq.publish_done(s.request_id);
+            if let Some(moq) = moq_handle_for(conns, s.client_id) {
+                moq.session.publish_done(s.request_id, moq.transport);
                 info!("conn {} publish done for {}", s.client_id, s.request_id);
             }
             false
@@ -836,7 +870,6 @@ fn post_handle_recvs(r: &mut Runner) {
     }
 
     // forward_local_tracks: forward local track caches → QUIC aliases
-    let (conns, ad) = r.endpoint.mut_conns_and_app_data();
     for track in ad.local_tracks.values_mut() {
         if track.aliases.is_empty() { continue; }
         forward_local_track(track, conns);
@@ -845,13 +878,12 @@ fn post_handle_recvs(r: &mut Runner) {
     // --usr1-toggle-padding-stream: runs after handle() so dirty is already set;
     // post_handle below will flush the padding stream state to the lower layers.
     if usr1_toggle_padding_stream {
-        let (conns, _) = r.endpoint.mut_conns_and_app_data();
-        for (_, conn) in conns.iter_mut() {
-            let Some(mut moq) = conn.app_data.moq_helper.moq_handle(&mut conn.conn) else { continue };
-            if moq.padding_stream_running() {
-                moq.stop_padding_stream();
+        for conn in conns.values_mut() {
+            let moq = conn.handle();
+            if moq.session.padding_stream_running() {
+                moq.session.stop_padding_stream(moq.transport);
             } else {
-                moq.start_padding_stream();
+                moq.session.start_padding_stream();
             }
         }
         info!("toggled padding stream on all connections (SIGUSR1)");
@@ -862,12 +894,11 @@ fn post_handle_recvs(r: &mut Runner) {
     // populated by the announce_namespaces phase above) — same post-handle
     // placement as --usr1-toggle-padding-stream above.
     if !usr1_unpub.is_empty() {
-        let (conns, _) = r.endpoint.mut_conns_and_app_data();
-        for (cid, conn) in conns.iter_mut() {
-            let Some(mut moq) = conn.app_data.moq_helper.moq_handle(&mut conn.conn) else { continue };
-            for ns in &usr1_unpub {
-                if let Some(rid) = conn.app_data.announced_namespaces.remove(ns) {
-                    moq.publish_namespace_done(rid);
+        for (&cid, conn) in conns.iter_mut() {
+            let (moq, state) = conn.parts();
+            for ns in usr1_unpub {
+                if let Some(rid) = state.borrow_mut().announced_namespaces.remove(ns) {
+                    moq.session.publish_namespace_done(rid, moq.transport);
                     info!("conn {cid} withdrew namespace {ns} (SIGUSR1)");
                 }
             }
@@ -875,22 +906,10 @@ fn post_handle_recvs(r: &mut Runner) {
     }
 
     // post handle phase
-    for_each_moq_handle(&mut r.endpoint, |moq, _| {
-        moq.post_handle();
-    });
-}
-
-/// run f for every moq_handle
-fn for_each_moq_handle<F>(e: &mut Endpoint<ConnAppData, AppData>, mut f: F)
-where 
-    F: FnMut(&mut MoqHandle, &mut AppData)
-{
-    let (conns, app_data) = e.mut_conns_and_app_data();
-    for (_, conn) in conns {
-        let Some(mut moq) = conn.app_data.moq_helper.moq_handle(&mut conn.conn) else { continue };
-        f(&mut moq, app_data);
+    for conn in conns.values_mut() {
+        let moq = conn.handle();
+        moq.session.post_handle(moq.transport);
     }
-     
 }
 
 /// Accepts a PUBLISH if a matching `--sub`/`--sub-passive` entry for `cid` is
@@ -899,9 +918,9 @@ where
 /// `--pub-passive` namespace/global wildcard — dynamically registering a
 /// passive sub track for it, the same way a concrete `--sub-passive` entry
 /// would have — otherwise rejects it as uninteresting.
-fn accept_or_reject_track_publish(moq: &mut MoqHandle, ad: &mut AppData, cid: ClientId) {
+fn accept_or_reject_track_publish(moq: &mut MoqHandle<'_, impl Transport>, ad: &mut AppData, cid: ClientId) {
     let pub_passive_wildcards = ad.pub_passive_wildcards.clone();
-    moq.process_track_publish_requests(|_request_id, cm| {
+    moq.session.process_track_publish_requests(|_request_id, cm| {
         let nt = cm.namespace_trackname.clone();
         let alias = cm.track_alias;
         let subs = ad.client_sub_tracks.entry(cid).or_default();
@@ -918,7 +937,7 @@ fn accept_or_reject_track_publish(moq: &mut MoqHandle, ad: &mut AppData, cid: Cl
         }
         info!("conn {cid} reject publish {nt}");
         PublishRequestAction::Reject(REQUEST_ERROR_UNINTERESTED)
-    });
+    }, moq.transport);
 }
 
 /// Drives every `--sub`/`--sub-passive` entry for `cid` forward one tick:
@@ -927,20 +946,20 @@ fn accept_or_reject_track_publish(moq: &mut MoqHandle, ad: &mut AppData, cid: Cl
 /// their `track_alias` instead), polls for the resulting alias, then drains
 /// any objects available on it into the local track cache (and its file
 /// outputs, if configured).
-fn drain_client_sub_tracks(moq: &mut MoqHandle, ad: &mut AppData, cid: ClientId) {
+fn drain_client_sub_tracks(moq: &mut MoqHandle<'_, impl Transport>, ad: &mut AppData, cid: ClientId) {
     let (cache_depth, cache_max_obj, cache_avg_obj) = (ad.cache_depth, ad.cache_max_obj, ad.cache_avg_obj);
     let Some(sub_tracks) = ad.client_sub_tracks.get_mut(&cid) else { return };
     for st in sub_tracks.iter_mut() {
         if st.request_id.is_none() {
             if st.passive { continue; } // wait for incoming PUBLISH to set track_alias
-            match moq.subscribe(&st.track, st.priority, st.delivery_timeout, st.filter.unwrap_or(FilterType::NextGroupStart)) {
+            match moq.session.subscribe(&st.track, st.priority, st.delivery_timeout, st.filter.unwrap_or(FilterType::NextGroupStart), moq.transport) {
                 Ok(rid) => { st.request_id = Some(rid); info!("conn {cid} subscribe {}", st.track); }
                 Err(e) => { error!("subscribe {}: {e:?}", st.track); continue; }
             }
         }
         if st.track_alias.is_none() {
             if let Some(rid) = st.request_id {
-                match moq.poll_subscribe_response(rid) {
+                match moq.session.poll_subscribe_response(rid) {
                     Some(Ok((alias, _))) => { st.track_alias = Some(alias); info!("conn {cid} accepted subscribe {}", st.track); }
                     Some(Err(e)) => { error!("subscribe rejected {}: {e}", st.track); }
                     None => continue,
@@ -951,18 +970,18 @@ fn drain_client_sub_tracks(moq: &mut MoqHandle, ad: &mut AppData, cid: ClientId)
         let track_nt = st.track.clone();
         'objects: loop {
             if st.obj_hdr.is_none() {
-                match moq.read_obj_hdr(alias) {
+                match moq.session.read_obj_hdr(alias, moq.transport) {
                     Ok(h) => st.obj_hdr = Some(h),
-                    Err(moq::Error::Done | moq::Error::Fin) => break,
+                    Err(MoqError::Done | MoqError::Fin) => break,
                     Err(e) => { error!("read_obj_hdr: {e:?}"); break; }
                 }
             }
             let payload_len = st.obj_hdr.as_ref().unwrap().payload_len();
             while st.obj_buf.len() < payload_len {
                 let mut tmp = vec![0u8; payload_len - st.obj_buf.len()];
-                match moq.read_obj_pld(&mut tmp, alias) {
+                match moq.session.read_obj_pld(&mut tmp, alias, moq.transport) {
                     Ok(n) => st.obj_buf.extend_from_slice(&tmp[..n]),
-                    Err(moq::Error::Done) => break 'objects,
+                    Err(MoqError::Done) => break 'objects,
                     Err(_) => { st.obj_hdr = None; st.obj_buf.clear(); continue 'objects; }
                 }
             }
@@ -991,7 +1010,7 @@ fn drain_client_sub_tracks(moq: &mut MoqHandle, ad: &mut AppData, cid: ClientId)
 
 // ── server connection handler ─────────────────────────────────────────────────
 
-fn process_server_conn(cid: ClientId, mut moq: MoqHandle, ad: &mut AppData) {
+fn process_server_conn(cid: ClientId, mut moq: MoqHandle<'_, impl Transport>, ad: &mut AppData) {
     // Collect subscription decisions without calling moq inside the closure
     // (process_subscription_requests takes &mut moq, preventing a second borrow for accept_subscription).
     enum SubDecision {
@@ -999,7 +1018,7 @@ fn process_server_conn(cid: ClientId, mut moq: MoqHandle, ad: &mut AppData) {
         QueueRelay { request_id: RequestId, nt: NamespaceTrackname, filter: FilterType, priority: u8, delivery_timeout: Option<u64> },
     }
     let mut decisions: Vec<SubDecision> = Vec::new();
-    moq.process_subscription_requests(|request_id, cm, _track_alias| {
+    moq.session.process_subscription_requests(|request_id, cm, _track_alias| {
         let request_id = *request_id;
         let nt = cm.namespace_trackname.clone();
         // Explicitly registered track (--pub-passive / --pub) — serve locally.
@@ -1035,7 +1054,7 @@ fn process_server_conn(cid: ClientId, mut moq: MoqHandle, ad: &mut AppData) {
         }
         info!("conn {cid} reject subscription {nt}");
         SubscriptionRequestAction::Reject(REQUEST_ERROR_DOES_NOT_EXIST)
-    });
+    }, moq.transport);
     for decision in decisions {
         match decision {
             SubDecision::AcceptLocal { request_id, nt, filter, priority, delivery_timeout } => {
@@ -1067,7 +1086,7 @@ fn process_server_conn(cid: ClientId, mut moq: MoqHandle, ad: &mut AppData) {
             }
         }
     }
-    moq.process_namespace_publish_requests(|_request_id, cm| {
+    moq.session.process_namespace_publish_requests(|_request_id, cm| {
         let ns = cm.track_namespace().clone();
         let want = !ad.sub_passive_wildcards.is_empty()
             || ad.relay_namespace.iter().any(|p| p.matches_namespace(&ns));
@@ -1078,7 +1097,7 @@ fn process_server_conn(cid: ClientId, mut moq: MoqHandle, ad: &mut AppData) {
         } else {
             NamespacePublishRequestAction::Keep
         }
-    });
+    }, moq.transport);
 
     // Lazily init sub tracks for this server connection the first time we see it.
     if !ad.client_sub_tracks.contains_key(&cid) && !ad.sub_track_templates.is_empty() {
@@ -1093,27 +1112,27 @@ fn process_server_conn(cid: ClientId, mut moq: MoqHandle, ad: &mut AppData) {
     drain_client_sub_tracks(&mut moq, ad, cid);
 }
 
-fn process_upstream_conn(cid: ClientId, mut moq: MoqHandle, ad: &mut AppData) {
-    moq.process_namespace_publish_requests(|_request_id, cm| {
+fn process_upstream_conn(cid: ClientId, moq: MoqHandle<'_, impl Transport>, ad: &mut AppData) {
+    moq.session.process_namespace_publish_requests(|_request_id, cm| {
         let ns = cm.track_namespace().clone();
         ad.namespaces.entry(ns.clone()).or_insert(cid);
         info!("conn {cid} upstream announced namespace {ns}");
         NamespacePublishRequestAction::Accept
-    });
+    }, moq.transport);
 }
 
-/// Looks up `cid`'s MoQ session handle, if the connection still exists and
-/// has completed its WebTransport/MoQ session setup. The single-call
-/// replacement for the `conns.get_mut(cid)` + `moq_helper.moq_handle(...)`
-/// pair repeated throughout the relay/forwarding code below.
-fn moq_handle_for(conns: &mut ConnMap<ConnAppData>, cid: ClientId) -> Option<MoqHandle<'_>> {
-    let conn = conns.get_mut(cid)?;
-    conn.app_data.moq_helper.moq_handle(&mut conn.conn)
+fn moq_handle_for<S: BorrowMut<MoqTransportSession>, T: Transport, C>(
+    conns: &mut Connections<S, T, C>, cid: ClientId,
+) -> Option<MoqHandle<'_, T>> {
+    let moq = conns.get_mut(&cid)?.handle();
+    moq.session.initialized().then_some(moq)
 }
 
 // ── relay subscription forwarding ─────────────────────────────────────────────
 
-fn forward_relay_subscription(nt: &NamespaceTrackname, sub: &mut RelaySubscription, conns: &mut ConnMap<ConnAppData>) {
+fn forward_relay_subscription<S: BorrowMut<MoqTransportSession>, T: Transport, C>(
+    nt: &NamespaceTrackname, sub: &mut RelaySubscription, conns: &mut Connections<S, T, C>,
+) {
     let Some((pub_id, pub_ta)) = sub.publisher.as_ref().and_then(|p| p.track_alias.map(|ta| (p.client_id, ta))) else { return };
     if !sub.has_accepted_subscribers() { return; }
     loop {
@@ -1130,9 +1149,9 @@ fn forward_relay_subscription(nt: &NamespaceTrackname, sub: &mut RelaySubscripti
             for s in &mut sub.subscribers {
                 if s.location != canceled_loc || s.remaining == 0 { continue; }
                 let Some(sub_ta) = s.track_alias else { s.remaining = 0; continue };
-                if let Some(mut moq) = moq_handle_for(conns, s.client_id) {
+                if let Some(moq) = moq_handle_for(conns, s.client_id) {
                     error!("reset stream for subscriber {} on {nt}: upstream subgroup canceled", s.client_id);
-                    moq.reset_current_track_stream(sub_ta);
+                    moq.session.reset_current_track_stream(sub_ta, moq.transport);
                 }
                 s.remaining = 0;
             }
@@ -1140,47 +1159,47 @@ fn forward_relay_subscription(nt: &NamespaceTrackname, sub: &mut RelaySubscripti
         if !sub.cache.is_empty() {
             for s in &mut sub.subscribers {
                 let Some(sub_ta) = s.track_alias else { continue };
-                let Some(mut moq) = moq_handle_for(conns, s.client_id) else { continue };
+                let Some(moq) = moq_handle_for(conns, s.client_id) else { continue };
                 if s.remaining > 0 && sub.cache.find(s.location.unwrap()).is_none() {
-                    moq.reset_current_track_stream(sub_ta); s.remaining = 0;
+                    moq.session.reset_current_track_stream(sub_ta, moq.transport); s.remaining = 0;
                 }
                 let obj = if s.remaining > 0 { sub.cache.find(s.location.unwrap()) } else { sub.cache.next_after(s.location) };
                 let Some(obj) = obj else { continue };
                 if s.remaining == 0 {
-                    match moq.send_obj_hdr_with(Some(obj.location().group), None, Some(obj.location().object), obj.payload_len(), &obj.ext_hdrs(), sub_ta, Some(obj.received_at())) {
+                    match moq.session.send_obj_hdr_with(Some(obj.location().group), None, Some(obj.location().object), obj.payload_len(), &obj.ext_hdrs(), sub_ta, Some(obj.received_at()), moq.transport) {
                         Ok(()) => { s.location = Some(obj.location()); s.remaining = obj.payload_len(); }
-                        Err(moq::Error::ObjectExpired) => { s.location = Some(obj.location()); s.remaining = 0; continue; }
-                        Err(moq::Error::InsufficientCapacity) => continue,
+                        Err(MoqError::ObjectExpired) => { s.location = Some(obj.location()); s.remaining = 0; continue; }
+                        Err(MoqError::InsufficientCapacity) => continue,
                         Err(e) => { error!("relay send_obj_hdr_with on {nt}: {e:?}"); continue; }
                     }
                 }
                 let read_pos = obj.payload_len() - s.remaining;
                 let available = obj.readable_from(read_pos);
                 if !available.is_empty() {
-                    if let Ok(n) = moq.send_obj_pld(available, sub_ta) { s.remaining -= n; }
+                    if let Ok(n) = moq.session.send_obj_pld(available, sub_ta, moq.transport) { s.remaining -= n; }
                 }
             }
         }
         let mut progress = false;
-        if let Some(mut moq) = moq_handle_for(conns, pub_id) {
+        if let Some(moq) = moq_handle_for(conns, pub_id) {
             let in_progress = sub.cache.latest().is_some_and(|o: CachedObjectRef| !o.is_complete());
             if in_progress {
                 let mut obj = sub.cache.latest_mut().unwrap();
-                match moq.read_obj_pld(obj.unfilled(), pub_ta) {
+                match moq.session.read_obj_pld(obj.unfilled(), pub_ta, moq.transport) {
                     Ok(n) => { obj.advance_write_pos(n); progress = true; }
-                    Err(moq::Error::Done) => {}
+                    Err(MoqError::Done) => {}
                     Err(_) => { sub.subgroup_canceled = true; progress = true; }
                 }
             } else {
-                match moq.read_obj_hdr(pub_ta) {
+                match moq.session.read_obj_hdr(pub_ta, moq.transport) {
                     Ok(hdr) => {
-                        let group = moq.subgroup_header(pub_ta)
+                        let group = moq.session.subgroup_header(pub_ta)
                             .map_or_else(|| sub.cache.latest().map_or(0, |o: CachedObjectRef| o.location().group), |sg| sg.group_id());
                         let _ = sub.cache.begin(Location { group, object: hdr.id() }, hdr.extension_headers().clone(), hdr.payload_len());
                         progress = true;
                     }
-                    Err(moq::Error::Done) => {}
-                    Err(moq::Error::Fin) => { sub.publisher = None; for s in &mut sub.subscribers { s.publisher_gone = true; } break; }
+                    Err(MoqError::Done) => {}
+                    Err(MoqError::Fin) => { sub.publisher = None; for s in &mut sub.subscribers { s.publisher_gone = true; } break; }
                     Err(e) => { error!("relay read_obj_hdr on {nt}: {e:?}"); break; }
                 }
             }
@@ -1191,14 +1210,16 @@ fn forward_relay_subscription(nt: &NamespaceTrackname, sub: &mut RelaySubscripti
 
 // ── local track forwarding ────────────────────────────────────────────────────
 
-fn forward_local_track(track: &mut LocalTrack, conns: &mut ConnMap<ConnAppData>) {
+fn forward_local_track<S: BorrowMut<MoqTransportSession>, T: Transport, C>(
+    track: &mut LocalTrack, conns: &mut Connections<S, T, C>,
+) {
     const BATCH: usize = 4;
     for als in track.aliases.iter_mut() {
         for _ in 0..BATCH {
             if als.remaining > 0 {
                 if track.cache.find(als.last_sent.unwrap()).is_none() {
-                    if let Some(mut moq) = moq_handle_for(conns, als.conn_id) {
-                        moq.reset_current_track_stream(als.alias);
+                    if let Some(moq) = moq_handle_for(conns, als.conn_id) {
+                        moq.session.reset_current_track_stream(als.alias, moq.transport);
                     }
                     als.remaining = 0;
                 } else {
@@ -1206,8 +1227,8 @@ fn forward_local_track(track: &mut LocalTrack, conns: &mut ConnMap<ConnAppData>)
                     let read_pos = obj.payload_len() - als.remaining;
                     let available = obj.readable_from(read_pos);
                     if !available.is_empty()
-                        && let Some(mut moq) = moq_handle_for(conns, als.conn_id)
-                        && let Ok(n) = moq.send_obj_pld(available, als.alias) {
+                        && let Some(moq) = moq_handle_for(conns, als.conn_id)
+                        && let Ok(n) = moq.session.send_obj_pld(available, als.alias, moq.transport) {
                         als.remaining -= n;
                     }
                     continue;
@@ -1216,21 +1237,21 @@ fn forward_local_track(track: &mut LocalTrack, conns: &mut ConnMap<ConnAppData>)
             let Some(obj) = track.cache.next_after(als.last_sent) else { break };
             let loc = obj.location();
             let received_at = obj.received_at();
-            let Some(mut moq) = moq_handle_for(conns, als.conn_id) else { break };
-            match moq.send_obj_hdr_with(Some(loc.group), None, Some(loc.object), obj.payload_len(), &obj.ext_hdrs(), als.alias, Some(received_at)) {
+            let Some(moq) = moq_handle_for(conns, als.conn_id) else { break };
+            match moq.session.send_obj_hdr_with(Some(loc.group), None, Some(loc.object), obj.payload_len(), &obj.ext_hdrs(), als.alias, Some(received_at), moq.transport) {
                 Ok(()) => {}
-                Err(moq::Error::UnfinishedPayload) => {
-                    moq.reset_current_track_stream(als.alias);
-                    let _ = moq.send_obj_hdr_with(Some(loc.group), None, Some(loc.object), obj.payload_len(), &obj.ext_hdrs(), als.alias, Some(received_at));
+                Err(MoqError::UnfinishedPayload) => {
+                    moq.session.reset_current_track_stream(als.alias, moq.transport);
+                    let _ = moq.session.send_obj_hdr_with(Some(loc.group), None, Some(loc.object), obj.payload_len(), &obj.ext_hdrs(), als.alias, Some(received_at), moq.transport);
                 }
-                Err(moq::Error::ObjectExpired) => { als.last_sent = Some(loc); als.remaining = 0; continue; }
-                Err(moq::Error::InsufficientCapacity) => { debug!("backpressure on stream open, retrying"); break; }
+                Err(MoqError::ObjectExpired) => { als.last_sent = Some(loc); als.remaining = 0; continue; }
+                Err(MoqError::InsufficientCapacity) => { debug!("backpressure on stream open, retrying"); break; }
                 Err(e) => { error!("send_obj_hdr_with: {e:?}"); break; }
             }
             let available = obj.readable_from(0);
-            let sent = match moq.send_obj_pld(available, als.alias) {
+            let sent = match moq.session.send_obj_pld(available, als.alias, moq.transport) {
                 Ok(n) => n,
-                Err(moq::Error::Done | moq::Error::InsufficientCapacity) => 0,
+                Err(MoqError::Done | MoqError::InsufficientCapacity) => 0,
                 Err(e) => { error!("send_obj_pld: {e:?}"); 0 }
             };
             als.last_sent = Some(loc);

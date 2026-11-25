@@ -23,3 +23,4 @@ pub use session::PublishRequestAction;
 pub use session::NamespacePublishRequestAction;
 pub use quiche_utils::stream_id::StreamID;
 pub use moq_handle::MoqHandle;
+pub use transport::QuicheTransport;

@@ -29,7 +29,9 @@
             inherit system;
             overlays = [ (import rust-overlay) ];
           };
-          rustToolchain = pkgs.rust-bin.stable."1.92.0".default.override {
+          rust = pkgs.rust-bin.stable."1.95.0";
+          rustToolchain = rust.minimal;
+          devToolchain = rust.default.override {
             extensions = [
               "rust-src"
               "clippy"
@@ -109,12 +111,12 @@
             inputsFrom = [
               self'.packages.default
             ];
-            packages = [ pkgs.ffmpeg pkgs.wasm-pack ];
+            packages = [ devToolchain pkgs.ffmpeg pkgs.wasm-pack ];
             LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
             RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
             shellHook = ''
               # Symlink for IDEs
-              ln -sfn ${rustToolchain} $PWD/.rust-toolchain
+              ln -sfn ${devToolchain} $PWD/.rust-toolchain
             '';
           };
         };

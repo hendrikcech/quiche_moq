@@ -2098,7 +2098,10 @@ dependencies = [
  "libc",
  "log",
  "mio",
+ "moq_core",
+ "moq_core_async",
  "moq_loc",
+ "moq_noq",
  "moq_object_cache",
  "moq_pacing",
  "moq_wire",
@@ -2111,6 +2114,7 @@ dependencies = [
  "rstest",
  "serde_json",
  "tempfile",
+ "tokio",
  "url",
 ]
 
@@ -3607,6 +3611,16 @@ name = "short_buf"
 version = "0.1.0"
 
 [[package]]
+name = "signal-hook-registry"
+version = "1.4.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
+dependencies = [
+ "errno",
+ "libc",
+]
+
+[[package]]
 name = "simd-adler32"
 version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4021,6 +4035,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",
