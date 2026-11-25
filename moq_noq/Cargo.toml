@@ -1,0 +1,15 @@
+[package]
+name = "moq_noq"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bytes = { workspace = true }
+moq_core = { workspace = true }
+moq_core_async = { workspace = true }
+tokio = { workspace = true }
+web-transport-trait = "0.5"
+web-transport-noq = "0.5"
+
+[dev-dependencies]
+rcgen = { workspace = true }
