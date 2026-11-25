@@ -53,3 +53,18 @@ noq` with the same publish, subscribe, and relay flags. Clients verify TLS
 against system roots unless `--noq-insecure` is set (used only for the
 experiment's self-signed certificates). Quiche transport tuning, qlog, TLS
 key logging, and QUIC ping flags are not available with noq.
+
+To build and run with the sibling `../noq` fork instead of crates.io:
+
+```sh
+nix run ./moq_cli/nixnet#noq-local \
+  --override-input moq/noq-src "git+file:$(realpath ../noq)"
+```
+
+This uses Git-tracked files, including local edits, without copying the
+fork's `target/` directory or changing either checkout's default lockfile.
+`nixnet/noq.Cargo.lock` records the fork's dependency graph for offline Nix
+builds. If that graph changes, update it from a scratch copy of the workspace:
+start from the root `Cargo.lock`, run
+`cargo update -p noq --config 'patch.crates-io.noq.path="/absolute/path/to/noq/noq"'`,
+and copy the resulting lockfile to `nixnet/noq.Cargo.lock`.

@@ -65,10 +65,23 @@
         "type": "github"
       }
     },
+    "noq-src": {
+      "flake": false,
+      "locked": {
+        "path": "./moq_noq",
+        "type": "path"
+      },
+      "original": {
+        "path": "./moq_noq",
+        "type": "path"
+      },
+      "parent": []
+    },
     "root": {
       "inputs": {
         "flake-parts": "flake-parts",
         "nixpkgs": "nixpkgs",
+        "noq-src": "noq-src",
         "rust-overlay": "rust-overlay"
       }
     },
