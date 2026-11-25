@@ -84,10 +84,36 @@ nix run ./moq_cli/nixnet#noq-local \
 This uses Git-tracked files, including local edits, without copying the
 fork's `target/` directory or changing either checkout's default lockfile.
 `nixnet/noq.Cargo.lock` records the fork's dependency graph for offline Nix
-builds. If that graph changes, update it from a scratch copy of the workspace:
-start from the root `Cargo.lock`, run
-`cargo update -p noq --config 'patch.crates-io.noq.path="/absolute/path/to/noq/noq"'`,
-and copy the resulting lockfile to `nixnet/noq.Cargo.lock`.
+builds. To refresh it in a scratch copy of the workspace, use that fork lock
+as `Cargo.lock`, pass `[patch.crates-io]` overrides for both `noq` and
+`noq-proto` from the same checkout, and copy the resulting lock back.
 
-For an opt-in two-path subscriber-to-relay run, see the
-[MPQUIC nixnet smoke test](nixnet/README.md).
+## Multipath QUIC
+
+The standard builds do not enable multipath or need the fork. The Cargo
+`multipath` feature (also selected by `--all-features`) requires the fork's
+socket and scheduler APIs. The Nix package applies both overrides:
+
+```sh
+nix build .#moq-cli-multipath \
+  --override-input noq-src "git+file:$(realpath ../noq)"
+```
+
+On the relay, add `--backend noq --multipath --scheduler min-rtt` to the
+normal relay flags. On the subscriber, add the same flags plus `--bind`
+and `--additional-path`. For example, with two links already configured:
+
+```sh
+moq --backend noq --multipath --scheduler min-rtt \
+  --connect https://1.0.0.2 --bind 1.0.0.1:0 \
+  --additional-path 3.0.0.1:4443=3.0.0.2:443 --sub tos--video
+```
+
+Use `blest` instead of `min-rtt` to select BLEST. The scheduler is local to
+each sender; set it on the relay to affect relayed media. A requested
+second path must validate before MoQ starts. A peer that does not negotiate
+multipath can still connect when no second path was requested.
+
+See the [nixnet smoke test](nixnet/README.md) for a reproducible two-link run,
+and the [scheduler design note](../moq_noq/docs/moq-aware-scheduling.md) for
+how to add MoQ metadata without changing the wire protocol.
