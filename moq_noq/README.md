@@ -3,6 +3,7 @@
 This crate adapts an already-established `web_transport_trait::Session` to
 `moq_core::Transport` and `moq_core_async::AsyncTransport`. It does not change
 the existing quiche backends or perform TLS/ALPN/HTTP/3 negotiation itself.
+Construct and run the adapter inside a Tokio runtime.
 
 ```rust,ignore
 use moq_noq::{ConnectParams, MoqSession, web_transport_noq};
@@ -40,11 +41,13 @@ Dropping the adapter closes the session, including if another handle exists.
   unwraps payload sends and assumes full acceptance. Use incremental publishing
   and retry bounded payload chunks; adapting that helper requires a separate
   core change. In particular, a write larger than the configured budget cannot
-  succeed as a single call. Pending stream count and total receive bytes are not
-  independently capped by this draft (each receive half holds at most one
-  64 KiB chunk in addition to the native QUIC buffers).
-- `flush_sends` checks transport failure and retires bookkeeping, but does not
-  wait for all buffered bytes to reach QUIC or the peer.
+  succeed as a single call. Both budgets must also fit each encoded MoQ control
+  message, which the core submits as one write.
+- Pending stream count and total receive bytes are not independently capped
+  (each receive half holds at most one 64 KiB chunk in addition to the native
+  QUIC buffers).
+- `flush_sends` checks transport failure but does not wait for buffered bytes
+  to reach QUIC or the peer.
 - WT error codes are 32-bit. Unrepresentable codes are mapped to zero rather
   than truncated. Incremental scheduling and native qlog events are unavailable
   through the standard WT trait. STOP_SENDING error tombstones are bounded.
@@ -57,12 +60,12 @@ Dropping the adapter closes the session, including if another handle exists.
 From the workspace root:
 
 ```sh
-cargo fmt -p moq_noq
-cargo check -p moq_noq
-cargo test -p moq_noq
+cargo fmt -p moq_noq -- --check
+cargo check --locked -p moq_noq
+cargo test --locked -p moq_noq
 ```
 
-The workspace lockfile must be regenerated and committed after resolving the new
-crates. Add a noq loopback test with both client and server sides, partial writes,
-FIN, RESET_STREAM, STOP_SENDING, connection loss, and tiny queue budgets before
-considering the transport production-ready.
+The raw QUIC loopback tests cover client and server streams, small flow-control
+windows, bounded send queues, FIN, and MoQ setup and peer close. HTTP/3
+WebTransport, stream-credit exhaustion, and broader cancellation behavior still
+need coverage.
