@@ -8,12 +8,18 @@
     nixnet.url = "github:birneee/nixnet";
     test-certs.url = "github:birneee/test-certs";
     test-certs.inputs.nixpkgs.follows = "nixpkgs";
+    # The local-noq package replaces this placeholder with a checkout at invocation time.
+    noq-src = {
+      url = "path:./moq_noq";
+      flake = false;
+    };
   };
   outputs =
     inputs@{
       nixpkgs,
       flake-parts,
       rust-overlay,
+      noq-src,
       ...
     }:
     flake-parts.lib.mkFlake { inherit inputs; } {
@@ -37,7 +43,7 @@
           };
           toolchainWith =
             targets:
-            pkgs.rust-bin.stable."1.92.0".default.override {
+            pkgs.rust-bin.stable."1.95.0".default.override {
               extensions = [
                 "rust-src"
                 "clippy"
@@ -78,7 +84,8 @@
                 ./logo.svg
                 ./flake.nix
                 ./flake.lock
-                ./experiments
+                  ./experiments
+                  ./moq_cli/nixnet
               ]
             );
           };
@@ -92,16 +99,31 @@
           # non-store paths stops the scanner from seeing them.
           remapPaths = "--remap-path-prefix=/build=/src --remap-path-prefix=${rustToolchain}=/rust-toolchain";
           buildMember =
-            name: path:
+            path: localNoq:
             let
               manifest = (pkgs.lib.importTOML (./. + "/${path}/Cargo.toml")).package;
+              lockFile = if localNoq then ./moq_cli/nixnet/noq.Cargo.lock else ./Cargo.lock;
             in
             rustPlatform.buildRustPackage {
               pname = manifest.name;
               version = manifest.version;
-              inherit cargoLock;
+              cargoLock = cargoLock // { inherit lockFile; };
               src = cargoSrc;
               buildAndTestSubdir = [ path ];
+              cargoBuildFlags = pkgs.lib.optional localNoq "--locked";
+              cargoTestFlags = pkgs.lib.optional localNoq "--locked";
+              prePatch = pkgs.lib.optionalString localNoq ''
+                if [ ! -f ${noq-src}/noq/Cargo.toml ]; then
+                  echo 'Pass --override-input noq-src git+file:/path/to/noq (moq/noq-src from nixnet)' >&2
+                  exit 1
+                fi
+                cp ${lockFile} Cargo.lock
+                cat >> .cargo/config.toml <<'EOF'
+
+                [patch.crates-io]
+                noq = { path = "${noq-src}/noq" }
+                EOF
+              '';
               nativeBuildInputs = with pkgs; [
                 clang
                 git
@@ -164,11 +186,12 @@
           };
         in
         {
-          packages.moq-cli = buildMember "moq-cli" "moq_cli";
-          packages.time-client-example = buildMember "time-client" "quiche_moq/examples/time-client";
-          packages.time-server-example = buildMember "time-server" "quiche_moq/examples/time-server";
-          packages.video-client-example = buildMember "video-client" "quiche_moq/examples/video-client";
-          packages.video-server-example = buildMember "video-server" "quiche_moq/examples/video-server";
+          packages.moq-cli = buildMember "moq_cli" false;
+          packages.moq-cli-local-noq = buildMember "moq_cli" true;
+          packages.time-client-example = buildMember "quiche_moq/examples/time-client" false;
+          packages.time-server-example = buildMember "quiche_moq/examples/time-server" false;
+          packages.video-client-example = buildMember "quiche_moq/examples/video-client" false;
+          packages.video-server-example = buildMember "quiche_moq/examples/video-server" false;
           packages.web-player = webPlayer;
           packages.default = self'.packages.moq-cli;
           packages.interop-image = interopImages.image;

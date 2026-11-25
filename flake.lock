@@ -151,11 +151,24 @@
         "type": "github"
       }
     },
+    "noq-src": {
+      "flake": false,
+      "locked": {
+        "path": "./moq_noq",
+        "type": "path"
+      },
+      "original": {
+        "path": "./moq_noq",
+        "type": "path"
+      },
+      "parent": []
+    },
     "root": {
       "inputs": {
         "flake-parts": "flake-parts",
         "nixnet": "nixnet",
         "nixpkgs": "nixpkgs_2",
+        "noq-src": "noq-src",
         "rust-overlay": "rust-overlay",
         "test-certs": "test-certs"
       }

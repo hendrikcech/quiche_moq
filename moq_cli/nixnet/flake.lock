@@ -58,6 +58,7 @@
       "inputs": {
         "flake-parts": "flake-parts_2",
         "nixpkgs": "nixpkgs",
+        "noq-src": "noq-src",
         "rust-overlay": "rust-overlay"
       },
       "locked": {
@@ -197,6 +198,20 @@
         "repo": "nixpkgs",
         "type": "github"
       }
+    },
+    "noq-src": {
+      "flake": false,
+      "locked": {
+        "path": "./moq_noq",
+        "type": "path"
+      },
+      "original": {
+        "path": "./moq_noq",
+        "type": "path"
+      },
+      "parent": [
+        "moq"
+      ]
     },
     "root": {
       "inputs": {

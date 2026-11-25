@@ -16,10 +16,10 @@
         { pkgs, inputs', ... }:
         let
           nixnet = inputs'.nixnet.legacyPackages;
-          config = backend: {
+          config = backend: moq: {
             name = "moq-${backend}";
             nodePackages = with pkgs; [
-              inputs'.moq.packages.moq-cli
+              moq
               coreutils
               ffmpeg-headless
             ];
@@ -114,10 +114,11 @@
           };
         in
         {
-          packages.default = nixnet.mkExperiment (config "quiche");
-          packages.noq = nixnet.mkExperiment (config "noq");
-          packages.mermaid = nixnet.mkMermaid (config "quiche");
-          packages.mermaid-svg = nixnet.mkMermaidSvg (config "quiche");
+          packages.default = nixnet.mkExperiment (config "quiche" inputs'.moq.packages.moq-cli);
+          packages.noq = nixnet.mkExperiment (config "noq" inputs'.moq.packages.moq-cli);
+          packages.noq-local = nixnet.mkExperiment (config "noq" inputs'.moq.packages.moq-cli-local-noq);
+          packages.mermaid = nixnet.mkMermaid (config "quiche" inputs'.moq.packages.moq-cli);
+          packages.mermaid-svg = nixnet.mkMermaidSvg (config "quiche" inputs'.moq.packages.moq-cli);
         };
     };
 }
