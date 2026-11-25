@@ -59,3 +59,8 @@ $ moq --listen 8080 --pub chat--messages --in chat--messages
 $ moq --connect https://127.0.0.1:8080#upstream --sub chat--messages --out chat--messages
 ```
 
+## Nixnet experiment
+
+From the repo root on Linux, run `nix run ./moq_cli/nixnet`. The experiment
+generates test audio and video, sends them through a MoQ relay, and exits
+after FFmpeg decodes both tracks. No display or media download is needed.
