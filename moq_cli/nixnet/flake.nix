@@ -91,8 +91,10 @@
                       -movflags empty_moov+default_base_moof+frag_keyframe -f mp4 /tmp/pv.mp4 \
                       -map 1:a -c:a aac -movflags empty_moov+default_base_moof \
                       -frag_duration 1000000 -f mp4 /tmp/pa.mp4 &
+                    # Keep the group start and codec config when a whole fragment arrives at once.
                     moq --backend ${backend} --listen 443 \
                       --pub tos \
+                      --cache-depth 128 \
                       --pub-passive "tos--video#in=/tmp/pv.mp4" \
                       --pub-passive "tos--audio#in=/tmp/pa.mp4"
                   '';
