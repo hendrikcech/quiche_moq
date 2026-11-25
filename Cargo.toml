@@ -4,6 +4,7 @@ members = [
     "moq_core",
     "moq_core_async",
     "moq_tokio",
+    "moq_noq",
     "moq_cli",
     "moq_loc",
     "moq_object_cache",
