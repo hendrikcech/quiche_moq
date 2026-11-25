@@ -1317,6 +1317,22 @@ fn long_control_message_is_received() {
 }
 
 #[test]
+fn coalesced_subscriptions_need_only_one_readable_event() {
+    let mut p = d16_pipe();
+    let tracks = ["test--video", "test--audio"].map(|track| track.parse().unwrap());
+    let _subscriptions = tracks.each_ref().map(|track| {
+        p.client.subscribe(track, SubscribeOptions::default(), &mut p.client_t).unwrap()
+    });
+
+    p.deliver();
+    p.server.handle(&mut p.server_t, &[0], p.now);
+
+    for track in tracks {
+        assert_eq!(next_subscribe(&mut p.server).message().namespace_trackname, track);
+    }
+}
+
+#[test]
 fn oversized_object_header_closes_session() {
     let mut p = d16_pipe();
     let track_alias = subscribed_track(&mut p);
