@@ -113,7 +113,7 @@
               cargoBuildFlags = pkgs.lib.optional localNoq "--locked";
               cargoTestFlags = pkgs.lib.optional localNoq "--locked";
               prePatch = pkgs.lib.optionalString localNoq ''
-                if [ ! -f ${noq-src}/noq/Cargo.toml ]; then
+                if [ ! -f ${noq-src}/noq/Cargo.toml ] || [ ! -f ${noq-src}/noq-proto/Cargo.toml ]; then
                   echo 'Pass --override-input noq-src git+file:/path/to/noq (moq/noq-src from nixnet)' >&2
                   exit 1
                 fi
@@ -122,6 +122,7 @@
 
                 [patch.crates-io]
                 noq = { path = "${noq-src}/noq" }
+                noq-proto = { path = "${noq-src}/noq-proto" }
                 EOF
               '';
               nativeBuildInputs = with pkgs; [
@@ -188,6 +189,10 @@
         {
           packages.moq-cli = buildMember "moq_cli" false;
           packages.moq-cli-local-noq = buildMember "moq_cli" true;
+          packages.moq-cli-multipath = self'.packages.moq-cli-local-noq.overrideAttrs (_: {
+            cargoBuildFeatures = [ "multipath" ];
+            cargoCheckFeatures = [ "multipath" ];
+          });
           packages.time-client-example = buildMember "quiche_moq/examples/time-client" false;
           packages.time-server-example = buildMember "quiche_moq/examples/time-server" false;
           packages.video-client-example = buildMember "quiche_moq/examples/video-client" false;

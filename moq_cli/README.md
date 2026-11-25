@@ -88,3 +88,6 @@ builds. If that graph changes, update it from a scratch copy of the workspace:
 start from the root `Cargo.lock`, run
 `cargo update -p noq --config 'patch.crates-io.noq.path="/absolute/path/to/noq/noq"'`,
 and copy the resulting lockfile to `nixnet/noq.Cargo.lock`.
+
+For an opt-in two-path subscriber-to-relay run, see the
+[MPQUIC nixnet smoke test](nixnet/README.md).

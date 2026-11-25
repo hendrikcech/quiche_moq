@@ -16,35 +16,58 @@
         { pkgs, inputs', ... }:
         let
           nixnet = inputs'.nixnet.legacyPackages;
-          config = backend: moq: {
-            name = "moq-${backend}";
+          config = backend: moq: scheduler: let
+            inherit (pkgs.lib) optional optionalAttrs optionalString;
+            multipath = scheduler != null;
+            edgeMoq = if multipath then "${inputs'.moq.packages.moq-cli-multipath}/bin/moq" else "moq";
+            edgeFlags = optionalString multipath " --multipath --scheduler ${scheduler}";
+          in {
+            name = if multipath then "moq-mpquic-${scheduler}" else "moq-${backend}";
             nodePackages = with pkgs; [
               moq
               coreutils
               ffmpeg-headless
-            ];
+            ] ++ optional multipath pkgs.gnugrep;
             nodes = {
               client = {
-                networking.interfaces.veth1.ipv4.addresses = [
-                  {
-                    address = "1.0.0.1";
-                    prefixLength = 24;
-                  }
-                ];
+                networking.interfaces = {
+                  veth1.ipv4.addresses = [
+                    {
+                      address = "1.0.0.1";
+                      prefixLength = 24;
+                    }
+                  ];
+                } // optionalAttrs multipath {
+                  veth3.ipv4.addresses = [
+                    {
+                      address = "3.0.0.1";
+                      prefixLength = 24;
+                    }
+                  ];
+                };
                 scripts.main = {
                   exec = ''
                     mkfifo /tmp/sv.mp4 /tmp/sa.mp4
-                    moq --backend ${backend} ${pkgs.lib.optionalString (backend == "noq") "--noq-insecure"} \
-                      --connect https://1.0.0.2 \
+                    ${edgeMoq} --backend ${backend} ${optionalString (backend == "noq") "--noq-insecure"}${edgeFlags} \
+                      --connect https://1.0.0.2${optionalString multipath " --bind 1.0.0.1:0 --additional-path 3.0.0.1:4443=3.0.0.2:443"} \
                       --cache-depth 128 \
                       --sub "tos--video#filter=next-group-start" \
                       --sub "tos--audio#filter=next-group-start" \
                       --out "tos--video#file=/tmp/sv.mp4" \
-                      --out "tos--audio#file=/tmp/sa.mp4" &
-                    trap 'kill "$!" 2>/dev/null || true' EXIT
+                      --out "tos--audio#file=/tmp/sa.mp4"${optionalString multipath " >/tmp/moq-subscriber.log 2>&1"} &
+                    trap 'kill "$!" 2>/dev/null || true${optionalString multipath "; wait \"$!\" 2>/dev/null || true; cat /tmp/moq-subscriber.log"}' EXIT
                     timeout 30s ffmpeg -nostdin -v error -xerror -abort_on empty_output_stream \
                       -i /tmp/sv.mp4 -i /tmp/sa.mp4 -map 0:v -map 1:a -t 2 -f null -
-                    echo "Decoded audio and video through the MoQ relay"
+                    ${optionalString multipath ''
+                      grep -Eq 'MPQUIC scheduler: ${scheduler}$' /tmp/moq-subscriber.log || {
+                        echo "Subscriber did not report scheduler ${scheduler}" >&2
+                        exit 1
+                      }
+                      grep -Eq 'MPQUIC path [^ ]+ established: 3\.0\.0\.1:[0-9]+ -> 3\.0\.0\.2:443$' /tmp/moq-subscriber.log || {
+                        echo "Subscriber did not validate the second path" >&2
+                        exit 1
+                      }
+                    ''}echo "Decoded audio and video through the MoQ relay"
                   '';
                   await = true;
                 };
@@ -63,11 +86,18 @@
                       prefixLength = 24;
                     }
                   ];
+                } // optionalAttrs multipath {
+                  veth3.ipv4.addresses = [
+                    {
+                      address = "3.0.0.2";
+                      prefixLength = 24;
+                    }
+                  ];
                 };
                 scripts.main = {
                   exec = ''
                     # The subscriber waits for the relay to advertise the publisher's namespace.
-                    moq --backend ${backend} ${pkgs.lib.optionalString (backend == "noq") "--noq-insecure"} \
+                    ${edgeMoq} --backend ${backend} ${optionalString (backend == "noq") "--noq-insecure"}${edgeFlags} \
                       --listen 443 \
                       --connect 'https://2.0.0.2#upstream' \
                       --relay-namespace "tos--*" \
@@ -119,15 +149,25 @@
                 a.node = "relay";
                 b.node = "server";
               };
+            } // optionalAttrs multipath {
+              veth3 = {
+                netem.delayMs = 25;
+                a.node = "client";
+                b.node = "relay";
+              };
             };
+          } // optionalAttrs multipath {
+            workDir = null;
           };
         in
         {
-          packages.default = nixnet.mkExperiment (config "quiche" inputs'.moq.packages.moq-cli);
-          packages.noq = nixnet.mkExperiment (config "noq" inputs'.moq.packages.moq-cli);
-          packages.noq-local = nixnet.mkExperiment (config "noq" inputs'.moq.packages.moq-cli-local-noq);
-          packages.mermaid = nixnet.mkMermaid (config "quiche" inputs'.moq.packages.moq-cli);
-          packages.mermaid-svg = nixnet.mkMermaidSvg (config "quiche" inputs'.moq.packages.moq-cli);
+          packages.default = nixnet.mkExperiment (config "quiche" inputs'.moq.packages.moq-cli null);
+          packages.noq = nixnet.mkExperiment (config "noq" inputs'.moq.packages.moq-cli null);
+          packages.noq-local = nixnet.mkExperiment (config "noq" inputs'.moq.packages.moq-cli-local-noq null);
+          packages.mpquic-min-rtt = nixnet.mkExperiment (config "noq" inputs'.moq.packages.moq-cli "min-rtt");
+          packages.mpquic-blest = nixnet.mkExperiment (config "noq" inputs'.moq.packages.moq-cli "blest");
+          packages.mermaid = nixnet.mkMermaid (config "quiche" inputs'.moq.packages.moq-cli null);
+          packages.mermaid-svg = nixnet.mkMermaidSvg (config "quiche" inputs'.moq.packages.moq-cli null);
         };
     };
 }
