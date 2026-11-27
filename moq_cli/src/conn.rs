@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::ops::ControlFlow::{self, Break, Continue};
 
 use quiche_moq::{Announcement, Event, FetchOk, NamespaceSubscription, Publication, RequestFailure, Subscription, TracksSubscription};
 use quiche_moq::wire::control_message::{PublishOkMessage, SubscribeOkMessage};
@@ -215,30 +216,30 @@ impl Responses {
     }
 
     /// The answer to `request_id` if `accepted` takes it or it is a failure, any other stays filed.
-    fn take<T>(&mut self, request_id: RequestId, accepted: fn(Response) -> Result<T, Response>) -> Option<Result<T, RequestFailure>> {
+    fn take<T>(&mut self, request_id: RequestId, accepted: fn(Response) -> ControlFlow<Response, T>) -> Option<Result<T, RequestFailure>> {
         match self.0.remove(&request_id)? {
             Response::Error(e) => Some(Err(e)),
             response => match accepted(response) {
-                Ok(answer) => Some(Ok(answer)),
-                Err(other) => { self.0.insert(request_id, other); None }
+                Continue(answer) => Some(Ok(answer)),
+                Break(other) => { self.0.insert(request_id, other); None }
             },
         }
     }
 
     pub(crate) fn take_subscribe(&mut self, request_id: RequestId) -> Option<Result<(TrackAlias, SubscribeOkMessage), RequestFailure>> {
-        self.take(request_id, |r| match r { Response::SubscribeOk(alias, message) => Ok((alias, message)), other => Err(other) })
+        self.take(request_id, |r| match r { Response::SubscribeOk(alias, message) => Continue((alias, message)), other => Break(other) })
     }
 
     pub(crate) fn take_publish(&mut self, request_id: RequestId) -> Option<Result<PublishOkMessage, RequestFailure>> {
-        self.take(request_id, |r| match r { Response::PublishOk(message) => Ok(message), other => Err(other) })
+        self.take(request_id, |r| match r { Response::PublishOk(message) => Continue(message), other => Break(other) })
     }
 
     pub(crate) fn take_request_update(&mut self, request_id: RequestId) -> Option<Result<Option<Location>, RequestFailure>> {
-        self.take(request_id, |r| match r { Response::RequestUpdateOk(largest) => Ok(largest), other => Err(other) })
+        self.take(request_id, |r| match r { Response::RequestUpdateOk(largest) => Continue(largest), other => Break(other) })
     }
 
     pub(crate) fn take_fetch(&mut self, request_id: RequestId) -> Option<Result<FetchOk, RequestFailure>> {
-        self.take(request_id, |r| match r { Response::FetchOk(ok) => Ok(ok), other => Err(other) })
+        self.take(request_id, |r| match r { Response::FetchOk(ok) => Continue(ok), other => Break(other) })
     }
 
     /// The request ended without its answer taken.

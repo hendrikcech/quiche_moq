@@ -351,7 +351,7 @@ pub(super) fn send_active_publishes(conns: &mut Connections<'_>, ad: &mut AppDat
             }
             let Some(mut moq) = conn.moq else { continue };
             for apt in entry.iter_mut() {
-                if apt.request_id.is_none() {
+                let Some(rid) = apt.request_id else {
                     let local = ad.local_tracks.entry(apt.track.clone())
                         .or_insert_with(|| LocalTrack::new(cache_depth, cache_max_obj, cache_avg_obj, None));
                     let largest = local.largest();
@@ -371,18 +371,17 @@ pub(super) fn send_active_publishes(conns: &mut Connections<'_>, ad: &mut AppDat
                         Err(moq_core::Error::RequestBlocked) => {}
                         Err(e) => { error!("publish_track {}: {e:?}", apt.track); }
                     }
-                } else {
-                    let rid = apt.request_id.unwrap();
-                    match conn.state.responses.take_publish(rid) {
-                        Some(Ok(ok)) => {
-                            info!("conn {cid} accepted publish {}", apt.track);
-                            if let Some(local) = ad.local_tracks.get_mut(&apt.track) {
-                                apply_publish_ok(cid, &mut moq, rid, &ok, local);
-                            }
+                    continue;
+                };
+                match conn.state.responses.take_publish(rid) {
+                    Some(Ok(ok)) => {
+                        info!("conn {cid} accepted publish {}", apt.track);
+                        if let Some(local) = ad.local_tracks.get_mut(&apt.track) {
+                            apply_publish_ok(cid, &mut moq, rid, &ok, local);
                         }
-                        Some(Err(e)) => error!("conn {cid} rejected publish {}: {e}", apt.track),
-                        None => {}
                     }
+                    Some(Err(e)) => error!("conn {cid} rejected publish {}: {e}", apt.track),
+                    None => {}
                 }
             }
         }

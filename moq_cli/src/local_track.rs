@@ -174,9 +174,8 @@ impl LocalTrack {
             self.mark_end_of_group(last_of_group);
             self.group_id += 1;
             self.object_id = 0;
-            if self.group_interval_us > 0 {
-                self.group_start_time_us =
-                    (decode_time_us / self.group_interval_us) * self.group_interval_us;
+            if let Some(intervals) = decode_time_us.checked_div(self.group_interval_us) {
+                self.group_start_time_us = intervals * self.group_interval_us;
             }
         }
 

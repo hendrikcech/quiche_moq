@@ -88,16 +88,9 @@ pub fn webtransport_enabled_by_server(c: &quiche::h3::Connection) -> bool {
 
     for &(key, value) in c.peer_settings_raw().into_iter().flatten() {
         match key {
-            ENABLE_WEBTRANSPORT_H3_SETTINGS_PARAMETER_ID | WT_ENABLED_DRAFT_16_H3_SETTINGS_PARAMETER_ID => {
-                if value == 1 {
-                    return true;
-                }
-            }
-            WT_MAX_SESSIONS_H3_SETTINGS_PARAMETER_ID => {
-                if value > 0 {
-                    return true;
-                }
-            }
+            ENABLE_WEBTRANSPORT_H3_SETTINGS_PARAMETER_ID | WT_ENABLED_DRAFT_16_H3_SETTINGS_PARAMETER_ID
+                if value == 1 => return true,
+            WT_MAX_SESSIONS_H3_SETTINGS_PARAMETER_ID if value > 0 => return true,
             _ => {}
         }
     }

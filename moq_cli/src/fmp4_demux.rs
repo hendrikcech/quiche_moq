@@ -89,10 +89,7 @@ impl FMp4Demuxer {
     }
 
     fn process(&mut self) {
-        loop {
-            let Some((box_type, header_size, body_size)) = parse_box_header(&self.buf) else {
-                break;
-            };
+        while let Some((box_type, header_size, body_size)) = parse_box_header(&self.buf) {
             let total = header_size + body_size;
             if self.buf.len() < total {
                 break;
@@ -161,14 +158,12 @@ fn parse_trak(data: &[u8]) -> Option<TrackInfo> {
     let mut codec_config: Option<Vec<u8>> = None;
 
     iter_boxes(data, |btype, bdata| match btype {
-        b"tkhd" => {
-            if bdata.len() >= 24 {
-                track_id = if bdata[0] == 1 {
-                    u32be(bdata, 20)
-                } else {
-                    u32be(bdata, 12)
-                };
-            }
+        b"tkhd" if bdata.len() >= 24 => {
+            track_id = if bdata[0] == 1 {
+                u32be(bdata, 20)
+            } else {
+                u32be(bdata, 12)
+            };
         }
         b"mdia" => parse_mdia(bdata, &mut timescale, &mut codec_config),
         _ => {}
@@ -180,10 +175,8 @@ fn parse_trak(data: &[u8]) -> Option<TrackInfo> {
 
 fn parse_mdia(data: &[u8], timescale: &mut u32, codec_config: &mut Option<Vec<u8>>) {
     iter_boxes(data, |btype, bdata| match btype {
-        b"mdhd" => {
-            if bdata.len() >= 12 {
-                *timescale = if bdata[0] == 1 { u32be(bdata, 20) } else { u32be(bdata, 12) };
-            }
+        b"mdhd" if bdata.len() >= 12 => {
+            *timescale = if bdata[0] == 1 { u32be(bdata, 20) } else { u32be(bdata, 12) };
         }
         b"minf" => parse_minf(bdata, codec_config),
         _ => {}
@@ -252,14 +245,12 @@ impl FMp4Demuxer {
                 default_size = if flags & 0x000010 != 0 { let v = u32be(bdata, off); off += 4; v } else { trex.default_sample_size };
                 default_flags = if flags & 0x000020 != 0 { u32be(bdata, off) } else { trex.default_sample_flags };
             }
-            b"tfdt" => {
-                if bdata.len() >= 4 {
-                    base_decode_time = if bdata[0] == 1 && bdata.len() >= 12 {
-                        u64be(bdata, 4)
-                    } else if bdata.len() >= 8 {
-                        u32be(bdata, 4) as u64
-                    } else { 0 };
-                }
+            b"tfdt" if bdata.len() >= 4 => {
+                base_decode_time = if bdata[0] == 1 && bdata.len() >= 12 {
+                    u64be(bdata, 4)
+                } else if bdata.len() >= 8 {
+                    u32be(bdata, 4) as u64
+                } else { 0 };
             }
             b"trun" => {
                 if bdata.len() < 8 { return; }
