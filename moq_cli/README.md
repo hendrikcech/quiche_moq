@@ -105,8 +105,9 @@ and `--additional-path`. For example, with two links already configured:
 
 ```sh
 moq --backend noq --multipath --scheduler min-rtt \
-  --connect https://1.0.0.2 --bind 1.0.0.1:0 \
-  --additional-path 3.0.0.1:4443=3.0.0.2:443 --sub tos--video
+  --connect 'https://1.0.0.2#upstream' --bind 1.0.0.1:0 \
+  --additional-path 3.0.0.1:4443=3.0.0.2:443 \
+  --sub tos--video --out 'tos--video#file=video.mp4'
 ```
 
 Use `blest` instead of `min-rtt` to select BLEST. The scheduler is local to

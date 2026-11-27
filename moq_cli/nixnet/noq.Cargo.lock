@@ -2104,6 +2104,7 @@ dependencies = [
  "moq_object_cache",
  "moq_pacing",
  "moq_wire",
+ "noq-proto",
  "partial-borrow",
  "qlog",
  "quiche_endpoint_utils",
@@ -2113,6 +2114,7 @@ dependencies = [
  "quiche_utils",
  "rstest",
  "rustc-hash",
+ "rustls-platform-verifier",
  "serde_json",
  "signal-hook-mio",
  "tempfile",
@@ -2161,6 +2163,7 @@ dependencies = [
  "moq_core_async",
  "rcgen",
  "tokio",
+ "url",
  "web-transport-noq",
  "web-transport-trait",
 ]
