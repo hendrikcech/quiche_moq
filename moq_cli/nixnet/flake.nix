@@ -36,8 +36,11 @@
                     mkfifo /tmp/sv.mp4 /tmp/sa.mp4
                     moq --backend ${backend} ${pkgs.lib.optionalString (backend == "noq") "--noq-insecure"} \
                       --connect https://1.0.0.2 \
-                      --sub "tos--video#out=/tmp/sv.mp4&filter=next-group-start" \
-                      --sub "tos--audio#out=/tmp/sa.mp4&filter=next-group-start" &
+                      --cache-depth 128 \
+                      --sub "tos--video#filter=next-group-start" \
+                      --sub "tos--audio#filter=next-group-start" \
+                      --out "tos--video#file=/tmp/sv.mp4" \
+                      --out "tos--audio#file=/tmp/sa.mp4" &
                     trap 'kill "$!" 2>/dev/null || true' EXIT
                     timeout 30s ffmpeg -nostdin -v error -xerror -abort_on empty_output_stream \
                       -i /tmp/sv.mp4 -i /tmp/sa.mp4 -map 0:v -map 1:a -t 2 -f null -
@@ -63,14 +66,16 @@
                 };
                 scripts.main = {
                   exec = ''
+                    # The subscriber waits for the relay to advertise the publisher's namespace.
                     moq --backend ${backend} ${pkgs.lib.optionalString (backend == "noq") "--noq-insecure"} \
-                    --listen 443 \
-                    --connect 'https://2.0.0.2#upstream' \
-                    --sub-passive "*" \
-                    --pub-passive "*" \
-                    --cache-max-obj 1048576 \
-                    --cache-avg-obj 65536 \
-                    --cache-depth 64
+                      --listen 443 \
+                      --connect 'https://2.0.0.2#upstream' \
+                      --relay-namespace "tos--*" \
+                      --sub "*" \
+                      --pub "*" \
+                      --cache-max-obj 1048576 \
+                      --cache-avg-obj 65536 \
+                      --cache-depth 64
                   '';
                 };
               };
@@ -95,8 +100,10 @@
                     moq --backend ${backend} --listen 443 \
                       --pub tos \
                       --cache-depth 128 \
-                      --pub-passive "tos--video#in=/tmp/pv.mp4" \
-                      --pub-passive "tos--audio#in=/tmp/pa.mp4"
+                      --pub "tos--video#passive" \
+                      --pub "tos--audio#passive" \
+                      --in "tos--video#file=/tmp/pv.mp4" \
+                      --in "tos--audio#file=/tmp/pa.mp4"
                   '';
                 };
               };

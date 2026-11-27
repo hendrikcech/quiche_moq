@@ -112,8 +112,7 @@ fn route(ad: &AppData, cid: ClientId, kind: &FetchKind) -> Route {
 }
 
 /// Moves every downstream FETCH on as far as the cache, the publishers and the streams allow.
-pub(super) fn drive_fetches(r: &mut Runner) {
-    let (conns, ad) = r.endpoint.mut_conns_and_app_data();
+pub(super) fn drive_fetches(conns: &mut Connections<'_>, ad: &mut AppData) {
     for fetch in std::mem::take(&mut ad.fetches) {
         if let Some(state) = drive_fetch(fetch.client_id, fetch.state, conns, ad) {
             ad.fetches.push(DownstreamFetch { client_id: fetch.client_id, state });
@@ -122,7 +121,7 @@ pub(super) fn drive_fetches(r: &mut Runner) {
 }
 
 /// The fetch's next state, `None` once it ended.
-fn drive_fetch(cid: ClientId, state: FetchState, conns: &mut ConnMap<ConnAppData>, ad: &mut AppData) -> Option<FetchState> {
+fn drive_fetch(cid: ClientId, state: FetchState, conns: &mut Connections<'_>, ad: &mut AppData) -> Option<FetchState> {
     match state {
         FetchState::New(request) => start_fetch(cid, request, conns, ad),
         FetchState::Requested { request, source, upstream } => {
@@ -149,7 +148,7 @@ fn drive_fetch(cid: ClientId, state: FetchState, conns: &mut ConnMap<ConnAppData
     }
 }
 
-fn start_fetch(cid: ClientId, request: Request<Fetch>, conns: &mut ConnMap<ConnAppData>, ad: &mut AppData) -> Option<FetchState> {
+fn start_fetch(cid: ClientId, request: Request<Fetch>, conns: &mut Connections<'_>, ad: &mut AppData) -> Option<FetchState> {
     let message = request.message();
     let (priority, group_order) = (message.subscriber_priority, message.group_order.unwrap_or(GroupOrder::Ascending));
     match route(ad, cid, &message.kind) {
@@ -216,7 +215,7 @@ fn start_fetch(cid: ClientId, request: Request<Fetch>, conns: &mut ConnMap<ConnA
 /// - evicted or cancelled mid-payload: the stream is reset, by dropping `response`
 fn serve_from_cache(
     cid: ClientId, serving: CacheServing,
-    conns: &mut ConnMap<ConnAppData>, ad: &AppData,
+    conns: &mut Connections<'_>, ad: &AppData,
 ) -> Option<FetchState> {
     let CacheServing { response, nt, mut pending, mut sending, unknown_ranges } = serving;
     let (mut moq, _) = conn_for(conns, cid)?;
@@ -271,7 +270,7 @@ fn serve_from_cache(
 }
 
 /// Passes `source`'s fetch stream through to the subscriber's as far as both allow.
-fn relay(cid: ClientId, mut r: Relaying, conns: &mut ConnMap<ConnAppData>) -> Option<FetchState> {
+fn relay(cid: ClientId, mut r: Relaying, conns: &mut Connections<'_>) -> Option<FetchState> {
     let mut buf = [0u8; RECV_CHUNK];
     loop {
         if !r.carry.is_empty() {

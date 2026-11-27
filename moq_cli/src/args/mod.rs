@@ -12,6 +12,12 @@ use quiche_moq::SubscribeOptions;
 use std::path::PathBuf;
 use std::str::FromStr;
 
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    Quiche,
+    Noq,
+}
+
 /// Unified MoQ node: publish, subscribe, relay, and route tracks over MoQ transport.
 ///
 /// Signals:
@@ -22,6 +28,14 @@ use std::str::FromStr;
 #[derive(Parser, Debug, Clone)]
 #[command(name = "moq")]
 pub struct Args {
+    /// QUIC/WebTransport implementation to use.
+    #[arg(long, value_enum, default_value = "quiche")]
+    pub backend: Backend,
+
+    /// Skip server certificate verification with noq (isolated tests only).
+    #[arg(long)]
+    pub noq_insecure: bool,
+
     /// Listen for incoming QUIC connections on this port.
     /// - `#upstream`: fallback `--sub` source when no namespace announced yet;
     ///   announcements from here always accepted, no gating.
@@ -451,6 +465,28 @@ impl Args {
         {
             return Err("--supported-versions: drafts 15 and later can only be given alone".into());
         }
+        if self.backend == Backend::Quiche && self.noq_insecure {
+            return Err("--noq-insecure requires --backend noq".into());
+        }
+        if self.backend == Backend::Noq {
+            if self.listen.as_ref().is_some_and(|listen| listen.native)
+                || self.connect.iter().any(|target| !url::Url::parse(&target.url).is_ok_and(|url| url.scheme() == "https"))
+            {
+                return Err("--backend noq requires HTTPS WebTransport (no native QUIC)".into());
+            }
+            if self.reconnect || self.no_migration || self.keepalive != 0 || self.keepalive_no_pto_limit
+                || self.timeout != 30_000 || self.ssl_key_log_file.is_some() || self.qlog_dir.is_some()
+                || self.qlog_level != QlogLevelArg::Base || self.active_conn_id_limit.is_some()
+                || self.max_cwnd.is_some() || self.listen_quic() != QuicSettings::default()
+                || self.connect_quic() != QuicSettings::default()
+                || self.sigusr1.iter().chain(&self.sigusr2).any(|action| matches!(action, SigAction::Ping | SigAction::Migrate))
+            {
+                return Err("--backend noq does not support quiche transport tuning, keylog, qlog, reconnect, ping or migration flags".into());
+            }
+            if self.publish.iter().any(|arg| arg.datagram) {
+                return Err("--backend noq does not support object datagrams".into());
+            }
+        }
         Ok(())
     }
 
@@ -483,7 +519,7 @@ impl Args {
 }
 
 /// Transport settings of one side, `--listen-*` or `--connect-*`.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Default, PartialEq)]
 pub struct QuicSettings {
     pub init_cwnd: Option<usize>,
     pub max_pacing_rate: Option<u64>,
@@ -507,6 +543,23 @@ impl Default for Args {
         args.qlog_dir = None;
         args
     }
+}
+
+#[cfg(test)]
+#[test]
+fn noq_rejects_options_it_cannot_honor() {
+    for options in [
+        &["--listen", "443#native"][..],
+        &["--connect", "moqt://localhost"],
+        &["--max-pacing-rate", "1000"],
+        &["--sigusr2", "migrate"],
+        &["--pub", "test--track#datagram"],
+    ] {
+        let args = Args::try_parse_from(["moq", "--backend", "noq"].into_iter().chain(options.iter().copied())).unwrap();
+        assert!(args.validate().is_err(), "{options:?}");
+    }
+    let args = Args::try_parse_from(["moq", "--backend", "noq", "--connect", "https://localhost#upstream", "--noq-insecure"]).unwrap();
+    assert!(args.validate().is_ok());
 }
 
 pub fn parse_delimiter(s: &str) -> Result<u8, String> {

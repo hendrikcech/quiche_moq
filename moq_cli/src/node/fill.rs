@@ -13,7 +13,7 @@ pub(super) const FILL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Starts an upstream FETCH for what subscribers want before the track's objects, and reads the
 /// running ones into the cache, giving up after `FILL_TIMEOUT`. Whether anything was read.
-pub(super) fn drive_cache_fill(nt: &NamespaceTrackname, track: &mut LocalTrack, conns: &mut ConnMap<ConnAppData>) -> bool {
+pub(super) fn drive_cache_fill(nt: &NamespaceTrackname, track: &mut LocalTrack, conns: &mut Connections<'_>) -> bool {
     start_fill(nt, track, conns);
     let LocalTrack { cache, subscriptions, aliases, stats, fill, .. } = track;
     let mut progress = false;
@@ -34,7 +34,7 @@ pub(super) fn drive_cache_fill(nt: &NamespaceTrackname, track: &mut LocalTrack, 
 }
 
 /// FETCHes from the earliest wanted Location up to what is fetched or subscribed already.
-fn start_fill(nt: &NamespaceTrackname, track: &mut LocalTrack, conns: &mut ConnMap<ConnAppData>) {
+fn start_fill(nt: &NamespaceTrackname, track: &mut LocalTrack, conns: &mut Connections<'_>) {
     let LocalTrack { subscriptions, fill, .. } = track;
     let Some(wanted) = fill.wanted_from else { return };
     let Some((source, subscribed_from)) = subscriptions.iter().find_map(|s| Some((s.client_id, s.start?))) else { return };
@@ -70,7 +70,7 @@ fn end_before(until: Location) -> Option<Location> {
 /// Reads `fill`'s objects into the cache as far as they arrived: whether anything was read, and
 /// whether it is still running.
 fn read_fill(
-    fill: &mut UpstreamFill, cache: &mut PackedObjectCache, aliases: &mut [LocalAliasState], conns: &mut ConnMap<ConnAppData>,
+    fill: &mut UpstreamFill, cache: &mut PackedObjectCache, aliases: &mut [LocalAliasState], conns: &mut Connections<'_>,
 ) -> (bool, bool) {
     if !fill.accepted {
         let Some(responses) = responses_for(conns, fill.source) else { return (false, false) };

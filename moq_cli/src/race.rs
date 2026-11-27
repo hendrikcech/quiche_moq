@@ -8,12 +8,11 @@ use std::time::{Duration, Instant};
 use log::{info, warn};
 
 use quiche_mio_runner::quiche_endpoint::ClientId;
-use quiche_mio_runner::quiche_endpoint::ConnMap;
 use quiche_moq::wire::control_message::subscribe::LocationFilter;
 use quiche_moq::wire::{Location, NamespaceTrackname, RequestId, TrackAlias};
 
 use crate::args::RaceMode;
-use crate::conn::ConnAppData;
+use crate::conn::Connections;
 use crate::local_track::{cancel_abandoned, ActiveRace, LocalTrack, RaceCandidate, TrackSubscription};
 use crate::node::{conn_for, moq_handle_for, responses_for};
 
@@ -26,7 +25,7 @@ const SETTLE_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 /// Forward=0 subscription (draft-ietf-moq-transport-19 §5.1: kept alive so Forward=1
 /// takes effect immediately when `trigger_race` needs it — no fresh SUBSCRIBE
 /// round trip mid-race), and resolves pending initial SUBSCRIBE_OKs.
-pub(crate) fn ensure_race_candidates_established(nt: &NamespaceTrackname, track: &mut LocalTrack, conns: &mut ConnMap<ConnAppData>) {
+pub(crate) fn ensure_race_candidates_established(nt: &NamespaceTrackname, track: &mut LocalTrack, conns: &mut Connections<'_>) {
     let Some(race) = track.race.as_mut() else { return };
     for &cid in &race.candidates {
         if race.established.contains_key(&cid) { continue }
@@ -54,7 +53,7 @@ pub(crate) fn ensure_race_candidates_established(nt: &NamespaceTrackname, track:
 
 /// `SigAction::RaceProbe`: fires a `#race` track's leader election, see
 /// `trigger_data_race` and `trigger_probe_race`.
-pub(crate) fn trigger_race(nt: &NamespaceTrackname, track: &mut LocalTrack, conns: &mut ConnMap<ConnAppData>) {
+pub(crate) fn trigger_race(nt: &NamespaceTrackname, track: &mut LocalTrack, conns: &mut Connections<'_>) {
     match track.race.as_ref().map(|r| r.mode) {
         Some(RaceMode::Data) => trigger_data_race(nt, track, conns),
         Some(mode) => trigger_probe_race(nt, track, conns, mode),
@@ -86,7 +85,7 @@ fn forwarding_subscription(cid: ClientId, rid: RequestId, alias: Option<TrackAli
 /// `RaceMode::Data`: every established, non-leader candidate forwards from
 /// `race_start`; the first with content there wins.
 /// - no-op if a race is already in flight, or nothing established to race
-fn trigger_data_race(nt: &NamespaceTrackname, track: &mut LocalTrack, conns: &mut ConnMap<ConnAppData>) {
+fn trigger_data_race(nt: &NamespaceTrackname, track: &mut LocalTrack, conns: &mut Connections<'_>) {
     let target = race_start(track);
     let LocalTrack { subscriptions, race, .. } = track;
     let Some(race) = race.as_mut() else { return };
@@ -115,7 +114,7 @@ fn trigger_data_race(nt: &NamespaceTrackname, track: &mut LocalTrack, conns: &mu
 /// - `LARGEST_OBJECT >= target`: wins immediately, no need to wait for the Object
 /// - not ready (smaller `LARGEST_OBJECT`, no location, or `REQUEST_ERROR`):
 ///   demotes just that candidate, race stays open for the rest
-pub(crate) fn poll_active_race(nt: &NamespaceTrackname, track: &mut LocalTrack, conns: &mut ConnMap<ConnAppData>) {
+pub(crate) fn poll_active_race(nt: &NamespaceTrackname, track: &mut LocalTrack, conns: &mut Connections<'_>) {
     match track.race.as_ref().map(|r| r.mode) {
         Some(RaceMode::Data) => poll_data_race(nt, track, conns),
         Some(_) => poll_probe_race(nt, track, conns),
@@ -142,7 +141,7 @@ impl Polled {
 
 /// Polls every race participant's REQUEST_UPDATE response, up to the first
 /// caught up one.
-fn poll_participants(track: &LocalTrack, conns: &mut ConnMap<ConnAppData>) -> Polled {
+fn poll_participants(track: &LocalTrack, conns: &mut Connections<'_>) -> Polled {
     let mut polled = Polled::default();
     let Some(active) = track.race.as_ref().and_then(|r| r.active.as_ref()) else { return polled };
     for (&cid, &rid) in &active.participants {
@@ -160,7 +159,7 @@ fn poll_participants(track: &LocalTrack, conns: &mut ConnMap<ConnAppData>) -> Po
     polled
 }
 
-fn poll_data_race(nt: &NamespaceTrackname, track: &mut LocalTrack, conns: &mut ConnMap<ConnAppData>) {
+fn poll_data_race(nt: &NamespaceTrackname, track: &mut LocalTrack, conns: &mut Connections<'_>) {
     let polled = poll_participants(track, conns);
     for cid in polled.not_ready() { demote_race_participant(track, cid, conns); }
     if let Some(winner) = polled.winner {
@@ -181,7 +180,7 @@ fn poll_data_race(nt: &NamespaceTrackname, track: &mut LocalTrack, conns: &mut C
 /// flips it back to Forward=0 and, if that reached it, keeps it in
 /// `race.established` as an idle candidate, ready for the next
 /// `trigger_race` or `replace_lost_leader`.
-pub(crate) fn demote_race_participant(track: &mut LocalTrack, cid: ClientId, conns: &mut ConnMap<ConnAppData>) {
+pub(crate) fn demote_race_participant(track: &mut LocalTrack, cid: ClientId, conns: &mut Connections<'_>) {
     if let Some(race) = track.race.as_mut()
         && let Some(active) = race.active.as_mut()
     {
@@ -203,7 +202,7 @@ pub(crate) fn demote_race_participant(track: &mut LocalTrack, cid: ClientId, con
 /// The leader is gone (disconnected or ended) and no race is running: an
 /// established standby takes over at the first incomplete object, without a
 /// fresh SUBSCRIBE round trip.
-pub(crate) fn replace_lost_leader(nt: &NamespaceTrackname, track: &mut LocalTrack, conns: &mut ConnMap<ConnAppData>) {
+pub(crate) fn replace_lost_leader(nt: &NamespaceTrackname, track: &mut LocalTrack, conns: &mut Connections<'_>) {
     if track.subscriptions.iter().any(|s| s.race) { return }
     let Some(race) = track.race.as_ref() else { return };
     if race.active.is_some() { return }
@@ -226,7 +225,7 @@ pub(crate) fn replace_lost_leader(nt: &NamespaceTrackname, track: &mut LocalTrac
 /// `demote_race_participant`). No-op if there's no active race, or
 /// `winner_cid` isn't racing (a response/Object arriving after the race
 /// already resolved another way).
-pub(crate) fn resolve_race(nt: &NamespaceTrackname, track: &mut LocalTrack, winner_cid: ClientId, conns: &mut ConnMap<ConnAppData>) {
+pub(crate) fn resolve_race(nt: &NamespaceTrackname, track: &mut LocalTrack, winner_cid: ClientId, conns: &mut Connections<'_>) {
     let Some(active) = track.race.as_mut().and_then(|r| r.active.take()) else { return };
     let leader_cid = track.subscriptions.iter().find(|s| s.race).map(|s| s.client_id);
     let winner_is_leader = Some(winner_cid) == leader_cid;
@@ -251,7 +250,7 @@ pub(crate) fn resolve_race(nt: &NamespaceTrackname, track: &mut LocalTrack, winn
 
 /// REQUEST_UPDATE of Forward (and filter) on `cid`'s subscription `rid`;
 /// returns the update's Request ID.
-fn request_update(conns: &mut ConnMap<ConnAppData>, cid: ClientId, rid: RequestId, forward: bool, filter: Option<LocationFilter>) -> Option<RequestId> {
+fn request_update(conns: &mut Connections<'_>, cid: ClientId, rid: RequestId, forward: bool, filter: Option<LocationFilter>) -> Option<RequestId> {
     let (mut moq, handles) = conn_for(conns, cid)?;
     let subscription = handles.subscriptions.get(&rid)?;
     moq.session.request_update_forward(subscription, forward, filter, &mut moq.t)
@@ -271,7 +270,7 @@ fn subscription_ids(track: &LocalTrack, cid: ClientId) -> Option<(RequestId, Opt
 /// decided in `poll_probe_race`.
 /// - exactly one Forward=1 participant (`Keep`: leader, `Switch`: a standby)
 /// - no duplicated load on a shared link, unlike `Data`
-fn trigger_probe_race(nt: &NamespaceTrackname, track: &mut LocalTrack, conns: &mut ConnMap<ConnAppData>, mode: RaceMode) {
+fn trigger_probe_race(nt: &NamespaceTrackname, track: &mut LocalTrack, conns: &mut Connections<'_>, mode: RaceMode) {
     let target = race_start(track);
     let LocalTrack { subscriptions, race, .. } = track;
     let Some(race) = race.as_mut() else { return };
@@ -318,7 +317,7 @@ fn trigger_probe_race(nt: &NamespaceTrackname, track: &mut LocalTrack, conns: &m
 /// - behind or error: participant leaves, Forward state untouched
 /// - no answer until the deadline: participant leaves as well
 /// - nobody left: initial forwarder keeps the track
-fn poll_probe_race(nt: &NamespaceTrackname, track: &mut LocalTrack, conns: &mut ConnMap<ConnAppData>) {
+fn poll_probe_race(nt: &NamespaceTrackname, track: &mut LocalTrack, conns: &mut Connections<'_>) {
     let polled = poll_participants(track, conns);
     let winner = polled.winner;
     let leader = track.subscriptions.iter().find(|s| s.race).map(|s| s.client_id);
@@ -347,7 +346,7 @@ fn poll_probe_race(nt: &NamespaceTrackname, track: &mut LocalTrack, conns: &mut 
 /// - a new forwarder starts at `race_start`
 /// - the forwarder keeps the track if the winner can't be switched to
 ///   Forward=1, without a forwarder the settle is retried next tick
-fn settle_probe_race(nt: &NamespaceTrackname, track: &mut LocalTrack, winner: ClientId, conns: &mut ConnMap<ConnAppData>) {
+fn settle_probe_race(nt: &NamespaceTrackname, track: &mut LocalTrack, winner: ClientId, conns: &mut Connections<'_>) {
     let Some(active) = track.race.as_mut().and_then(|r| r.active.take()) else { return };
     let mut winner = winner;
     if active.forwarder != Some(winner) && !switch_to_forwarding(track, winner, conns) {
@@ -371,7 +370,7 @@ fn settle_probe_race(nt: &NamespaceTrackname, track: &mut LocalTrack, winner: Cl
 
 /// Flips `cid` to Forward=1 from `race_start` and makes sure its objects are
 /// read; false if the update couldn't be sent.
-fn switch_to_forwarding(track: &mut LocalTrack, cid: ClientId, conns: &mut ConnMap<ConnAppData>) -> bool {
+fn switch_to_forwarding(track: &mut LocalTrack, cid: ClientId, conns: &mut Connections<'_>) -> bool {
     let start = race_start(track);
     let Some((rid, alias)) = subscription_ids(track, cid) else { return false };
     if request_update(conns, cid, rid, true, Some(LocationFilter::AbsoluteStart { start })).is_none() { return false }
@@ -402,7 +401,7 @@ mod tests {
         loser.in_progress.push((loc, 4));
         track.subscriptions.push(loser);
 
-        demote_race_participant(&mut track, 1, &mut ConnMap::new());
+        demote_race_participant(&mut track, 1, &mut Connections::Quiche(&mut Default::default()));
 
         assert!(track.subscriptions.is_empty());
         assert_eq!(track.cache.find(loc).map(|o| o.state()), Some(ObjectState::Canceled));
@@ -425,7 +424,7 @@ mod tests {
         };
         track.race = Some(race_state(RaceMode::Switch, Some(active)));
 
-        poll_active_race(&nt, &mut track, &mut ConnMap::new());
+        poll_active_race(&nt, &mut track, &mut Connections::Quiche(&mut Default::default()));
 
         assert!(track.race.as_ref().unwrap().active.is_none());
         assert!(track.subscriptions.iter().any(|s| s.client_id == 1 && s.race), "leader must stay");
@@ -450,7 +449,7 @@ mod tests {
         race.established.insert(2, RaceCandidate { request_id: RequestId(4), track_alias: Some(TrackAlias(7)) });
         track.race = Some(race);
 
-        settle_probe_race(&nt, &mut track, 2, &mut ConnMap::new());
+        settle_probe_race(&nt, &mut track, 2, &mut Connections::Quiche(&mut Default::default()));
 
         assert!(track.subscriptions.iter().any(|s| s.client_id == 1 && s.race), "leader must stay");
         let race = track.race.as_ref().unwrap();
@@ -499,11 +498,11 @@ mod tests {
         };
 
         track.race = Some(race_state(RaceMode::Data, Some(active(Instant::now() + RACE_TIMEOUT))));
-        poll_active_race(&nt, &mut track, &mut ConnMap::new());
+        poll_active_race(&nt, &mut track, &mut Connections::Quiche(&mut Default::default()));
         assert!(track.race.as_ref().unwrap().active.is_some());
 
         track.race = Some(race_state(RaceMode::Data, Some(active(Instant::now()))));
-        poll_active_race(&nt, &mut track, &mut ConnMap::new());
+        poll_active_race(&nt, &mut track, &mut Connections::Quiche(&mut Default::default()));
         assert!(track.race.as_ref().unwrap().active.is_none());
     }
 }

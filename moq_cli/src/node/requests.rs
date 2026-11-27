@@ -140,7 +140,7 @@ pub(super) const ANSWERED_ON_ARRIVAL: &str = "a request answered in the tick it 
 /// Answers `local.pending_subscribes`: accepted once `local_track_ready`,
 /// rejected once every upstream subscription failed. Runs after
 /// `drive_track_subscriptions` in the tick.
-pub(super) fn drive_pending_subscribes(nt: &NamespaceTrackname, local: &mut LocalTrack, conns: &mut ConnMap<ConnAppData>) {
+pub(super) fn drive_pending_subscribes(nt: &NamespaceTrackname, local: &mut LocalTrack, conns: &mut Connections<'_>) {
     if local.pending_subscribes.is_empty() { return; }
     // only relayed tracks defer a SUBSCRIBE, so no subscription left means
     // every upstream rejected or disconnected
@@ -161,18 +161,17 @@ pub(super) fn drive_pending_subscribes(nt: &NamespaceTrackname, local: &mut Loca
 /// with `--relay-namespace` those learned elsewhere, except to their source.
 /// - withdrawn (PUBLISH_NAMESPACE_DONE) once gone
 /// - `--pub <NS--TRACK>` serves a track without announcing its namespace
-pub(super) fn announce_namespaces(r: &mut Runner) {
-    let (conns, ad) = r.endpoint.mut_conns_and_app_data();
+pub(super) fn announce_namespaces(conns: &mut Connections<'_>, ad: &mut AppData) {
     for (cid, conn) in conns.iter_mut() {
-        let Some(mut moq) = conn.app_data.moq_helper.moq_handle(&mut conn.conn) else { continue };
+        let Some(mut moq) = conn.moq else { continue };
         if !ad.relay_namespace.is_empty() {
-            let gone: Vec<Namespace> = conn.app_data.announced_namespaces.keys()
+            let gone: Vec<Namespace> = conn.state.announced_namespaces.keys()
                 .filter(|ns| !ad.local_namespaces.contains(ns)
                     && !ad.namespaces.get(ns).is_some_and(|owners| owners.iter().any(|&o| o != cid)))
                 .cloned()
                 .collect();
             for ns in gone {
-                let announcement = conn.app_data.announced_namespaces.remove(&ns).unwrap();
+                let announcement = conn.state.announced_namespaces.remove(&ns).unwrap();
                 moq.session.publish_namespace_done(announcement, &mut moq.t);
             }
         }
@@ -180,9 +179,9 @@ pub(super) fn announce_namespaces(r: &mut Runner) {
         let relayed = ad.namespaces.keys().filter(|ns| relay_ns.iter().any(|p| p.matches_namespace(ns)));
         for ns in ad.local_namespaces.iter().chain(relayed) {
             if ad.namespaces.get(ns).is_some_and(|owners| owners.contains(&cid)) { continue; }
-            if conn.app_data.announced_namespaces.contains_key(ns) { continue; }
+            if conn.state.announced_namespaces.contains_key(ns) { continue; }
             if let Ok(announcement) = moq.session.publish_namespace(ns.clone(), &mut moq.t) {
-                conn.app_data.announced_namespaces.insert(ns.clone(), announcement);
+                conn.state.announced_namespaces.insert(ns.clone(), announcement);
                 info!("conn {cid} announce namespace {ns}");
             }
         }
@@ -192,8 +191,7 @@ pub(super) fn announce_namespaces(r: &mut Runner) {
 /// Relayed upstream subscriptions deliver while a subscriber of the track has Forward State 1,
 /// with `--prewarm` always (draft-ietf-moq-transport-19 §9.2).
 /// One REQUEST_UPDATE at a time per subscription, the next once it is answered.
-pub(super) fn sync_relayed_forward(r: &mut Runner) {
-    let (conns, ad) = r.endpoint.mut_conns_and_app_data();
+pub(super) fn sync_relayed_forward(conns: &mut Connections<'_>, ad: &mut AppData) {
     let prewarm = ad.prewarm;
     for (nt, track) in ad.local_tracks.iter_mut() {
         // without subscribers: a PUBLISH keeps delivering into the cache, a relayed SUBSCRIBE ends
@@ -242,15 +240,14 @@ pub(super) fn answer_subscribe_namespace(cid: ClientId, moq: &mut MoqHandle, han
 
 /// NAMESPACE and NAMESPACE_DONE to each namespace subscriber as the namespaces
 /// under its prefix come and go: this node's and the ones announced to it, except by the subscriber.
-pub(super) fn sync_namespace_subscribers(r: &mut Runner) {
-    let (conns, ad) = r.endpoint.mut_conns_and_app_data();
+pub(super) fn sync_namespace_subscribers(conns: &mut Connections<'_>, ad: &mut AppData) {
     for (cid, conn) in conns.iter_mut() {
-        if conn.app_data.handles.namespace_subscriptions.is_empty() { continue; }
-        let Some(mut moq) = conn.app_data.moq_helper.moq_handle(&mut conn.conn) else { continue };
+        if conn.state.handles.namespace_subscriptions.is_empty() { continue; }
+        let Some(mut moq) = conn.moq else { continue };
         let published: HashSet<&Namespace> = ad.local_namespaces.iter()
             .chain(ad.namespaces.iter().filter(|(_, owners)| owners.iter().any(|&o| o != cid)).map(|(ns, _)| ns))
             .collect();
-        for subscriber in conn.app_data.handles.namespace_subscriptions.values_mut() {
+        for subscriber in conn.state.handles.namespace_subscriptions.values_mut() {
             let NamespaceSubscriber { prefix, handle, named } = subscriber;
             let new: Vec<&Namespace> = published.iter().copied().filter(|ns| !named.contains(*ns)).collect();
             for ns in new {
@@ -289,12 +286,11 @@ pub(super) fn answer_subscribe_tracks(cid: ClientId, moq: &mut MoqHandle, handle
 /// PUBLISH to each tracks subscriber of the tracks under its prefix as they appear, except those
 /// it publishes or subscribes to itself (draft-ietf-moq-transport-19 §9.5).
 /// - once per track: it ends with PUBLISH_DONE like a subscription when its source ends
-pub(super) fn sync_tracks_subscribers(r: &mut Runner) {
-    let (conns, ad) = r.endpoint.mut_conns_and_app_data();
+pub(super) fn sync_tracks_subscribers(conns: &mut Connections<'_>, ad: &mut AppData) {
     for (cid, conn) in conns.iter_mut() {
-        if conn.app_data.handles.tracks_subscriptions.is_empty() { continue; }
-        let ConnAppData { moq_helper, handles, responses, .. } = &mut conn.app_data;
-        let Some(mut moq) = moq_helper.moq_handle(&mut conn.conn) else { continue };
+        if conn.state.handles.tracks_subscriptions.is_empty() { continue; }
+        let ConnState { handles, responses, .. } = conn.state;
+        let Some(mut moq) = conn.moq else { continue };
         let Handles { tracks_subscriptions, publications, .. } = handles;
         for subscriber in tracks_subscriptions.values_mut() {
             for (nt, awaiting) in subscriber.published.iter_mut() {
@@ -344,22 +340,16 @@ pub(super) fn sync_tracks_subscribers(r: &mut Runner) {
 }
 
 /// PUBLISH of each `--pub` track on every initialized connection.
-pub(super) fn send_active_publishes(r: &mut Runner) {
-    let (conns, ad) = r.endpoint.mut_conns_and_app_data();
+pub(super) fn send_active_publishes(conns: &mut Connections<'_>, ad: &mut AppData) {
     if !ad.active_pub_tracks.is_empty() {
         let (cache_depth, cache_max_obj, cache_avg_obj) = (ad.cache_depth, ad.cache_max_obj, ad.cache_avg_obj);
-        let all_cids: Vec<ClientId> = conns.iter()
-            .map(|(cid, _)| cid)
-            .collect();
-        for cid in all_cids {
+        for (cid, conn) in conns.iter_mut() {
             let entry = ad.client_active_pub_tracks.entry(cid).or_default();
             for nt in &ad.active_pub_tracks {
                 if entry.iter().any(|e| &e.track == nt) { continue; }
                 entry.push(ClientActivePubTrack { track: nt.clone(), request_id: None });
             }
-            let Some(conn) = conns.get_mut(cid) else { continue };
-            let Some(mut moq) = conn.app_data.moq_helper.moq_handle(&mut conn.conn) else { continue };
-            let entry = ad.client_active_pub_tracks.get_mut(&cid).unwrap();
+            let Some(mut moq) = conn.moq else { continue };
             for apt in entry.iter_mut() {
                 if apt.request_id.is_none() {
                     let local = ad.local_tracks.entry(apt.track.clone())
@@ -368,7 +358,7 @@ pub(super) fn send_active_publishes(r: &mut Runner) {
                     match moq.session.publish_track(apt.track.clone(), quiche_moq::wire::KeyValuePairs::new(), true, largest, &mut moq.t) {
                         Ok(publication) => {
                             let (rid, alias) = (publication.request_id(), publication.track_alias());
-                            conn.app_data.handles.publications.insert(rid, publication);
+                            conn.state.handles.publications.insert(rid, publication);
                             apt.request_id = Some(rid);
                             // Unsolicited push (--pub), not a response to a peer's
                             // SUBSCRIBE — `publish_done`
@@ -383,7 +373,7 @@ pub(super) fn send_active_publishes(r: &mut Runner) {
                     }
                 } else {
                     let rid = apt.request_id.unwrap();
-                    match conn.app_data.responses.take_publish(rid) {
+                    match conn.state.responses.take_publish(rid) {
                         Some(Ok(ok)) => {
                             info!("conn {cid} accepted publish {}", apt.track);
                             if let Some(local) = ad.local_tracks.get_mut(&apt.track) {
@@ -476,8 +466,7 @@ pub(super) fn answer_subscribe(cid: ClientId, moq: &mut MoqHandle, handles: &mut
 }
 
 /// Routes the held SUBSCRIBEs whose publisher appeared, rejects the expired, the time until the next expires.
-pub(super) fn drive_rendezvous(r: &mut Runner, now: Instant) -> Option<Duration> {
-    let (conns, ad) = r.endpoint.mut_conns_and_app_data();
+pub(super) fn drive_rendezvous(conns: &mut Connections<'_>, ad: &mut AppData, now: Instant) -> Option<Duration> {
     let mut next = None;
     for held in std::mem::take(&mut ad.rendezvous) {
         let Some((mut moq, handles)) = conn_for(conns, held.client_id) else { continue };

@@ -70,7 +70,9 @@ experimental noq WebTransport backend. Outside nixnet, use `moq --backend
 noq` with the same publish, subscribe, and relay flags. Clients verify TLS
 against system roots unless `--noq-insecure` is set (used only for the
 experiment's self-signed certificates). Quiche transport tuning, qlog, TLS
-key logging, and QUIC ping flags are not available with noq.
+key logging, reconnect, native QUIC, and object datagrams are not available
+with noq. Its HTTP/3 WebTransport uses the legacy handshake, not draft 16;
+the MoQ transport draft is negotiated separately.
 
 To build and run with the sibling `../noq` fork instead of crates.io:
 

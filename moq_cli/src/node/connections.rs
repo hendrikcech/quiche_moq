@@ -8,9 +8,7 @@ pub(super) const RECONNECT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 /// SIGINT/SIGTERM: closes every session (CLOSE_WEBTRANSPORT_SESSION,
 /// draft-16 §3.4) and connection, then stops the runner.
 pub(super) fn shutdown(r: &mut Runner) {
-    for (nt, track) in r.endpoint.app_data().local_tracks.iter() {
-        info!("{}", format_track_stats(nt, &track.stats));
-    }
+    log_track_stats(r.endpoint.app_data());
     let (conns, _) = r.endpoint.mut_conns_and_app_data();
     for (_, conn) in conns.iter_mut() {
         if let Some(mut moq) = conn.app_data.moq_helper.moq_handle(&mut conn.conn) {
@@ -19,6 +17,12 @@ pub(super) fn shutdown(r: &mut Runner) {
         let _ = conn.conn.close(false, 0x0, b"");
     }
     r.close();
+}
+
+pub(super) fn log_track_stats(ad: &AppData) {
+    for (nt, track) in &ad.local_tracks {
+        info!("{}", format_track_stats(nt, &track.stats));
+    }
 }
 
 /// When keepalives and the sessions' timers need the loop to wake without I/O.
@@ -40,8 +44,7 @@ pub(super) fn connection_timeouts(r: &mut Runner) -> Option<Duration> {
 }
 
 /// The `SigAction`s of the signals since the last tick, each once.
-pub(super) fn take_signal_actions(r: &mut Runner) -> HashSet<SigAction> {
-    let ad = r.endpoint.app_data_mut();
+pub(super) fn take_signal_actions(ad: &mut AppData) -> HashSet<SigAction> {
     let mut actions = HashSet::new();
     if ad.usr1_requested {
         ad.usr1_requested = false;
@@ -100,46 +103,50 @@ pub(super) fn cleanup_closed_conns(r: &mut Runner, now: Instant) {
     let (conns, ad) = r.endpoint.mut_conns_and_app_data();
     for (cid, conn) in conns.iter_mut() {
         if !conn.conn.is_closed() { continue; }
-        info!("conn {cid} disconnected");
         let reconnect_url = conn.app_data.reconnect_url.take();
-        forget_announcements(cid, ad);
-        for (nt, track) in ad.local_tracks.iter_mut() {
-            let had_subscriptions = !track.subscriptions.is_empty();
-            let partial: Vec<Location> = track.subscriptions.iter()
-                .filter(|s| s.client_id == cid)
-                .flat_map(|s| s.in_progress.iter().map(|&(loc, _)| loc))
-                .collect();
-            track.subscriptions.retain(|s| s.client_id != cid);
-            // a disconnected #race candidate must not be raced or promoted
-            let was_standby = track.race.as_mut().is_some_and(|race| {
-                race.candidates.retain(|&c| c != cid);
-                race.established.remove(&cid).is_some()
-            });
-            // lost its last source, unless a `#race` standby or a template
-            // resubscribing after `--reconnect` takes over
-            let resumable = track.has_race_standby()
-                || reconnect_url.is_some() && ad.sub_track_templates.iter().any(|t| t.track == *nt);
-            if (had_subscriptions || was_standby) && track.subscriptions.is_empty() && !resumable {
-                for a in &mut track.aliases { a.publish_done = Some(PublishDoneStatus::TrackEnded); }
-            }
-            // nobody resends them, else they stay in progress forever
-            // - an active race's forwarder fills those from its target on
-            let racing_from = track.race.as_ref().and_then(|r| r.active.as_ref()).map(|a| a.target);
-            if !(track.subscriptions.is_empty() && resumable) {
-                for loc in partial.into_iter().filter(|&loc| racing_from.is_none_or(|target| loc < target)) {
-                    cancel_abandoned(&mut track.cache, &track.subscriptions, &mut track.stats, loc);
-                }
-            }
-            track.aliases.retain(|a| a.conn_id != cid);
-        }
-        ad.upstream_cids.remove(&cid);
-        ad.client_active_pub_tracks.remove(&cid);
+        disconnect(cid, ad, reconnect_url.is_some());
         if let Some(url) = reconnect_url {
             // right away, unless the last attempt did not even connect
             let delay = if conn.conn.is_established() { Duration::ZERO } else { RECONNECT_RETRY_INTERVAL };
             ad.pending_reconnects.push((now + delay, url));
         }
     }
+}
+
+pub(super) fn disconnect(cid: ClientId, ad: &mut AppData, reconnecting: bool) {
+    info!("conn {cid} disconnected");
+    forget_announcements(cid, ad);
+    for (nt, track) in ad.local_tracks.iter_mut() {
+        let had_subscriptions = !track.subscriptions.is_empty();
+        let partial: Vec<Location> = track.subscriptions.iter()
+            .filter(|s| s.client_id == cid)
+            .flat_map(|s| s.in_progress.iter().map(|&(loc, _)| loc))
+            .collect();
+        track.subscriptions.retain(|s| s.client_id != cid);
+        // a disconnected #race candidate must not be raced or promoted
+        let was_standby = track.race.as_mut().is_some_and(|race| {
+            race.candidates.retain(|&c| c != cid);
+            race.established.remove(&cid).is_some()
+        });
+        // lost its last source, unless a `#race` standby or a template
+        // resubscribing after `--reconnect` takes over
+        let resumable = track.has_race_standby()
+            || reconnecting && ad.sub_track_templates.iter().any(|t| t.track == *nt);
+        if (had_subscriptions || was_standby) && track.subscriptions.is_empty() && !resumable {
+            for a in &mut track.aliases { a.publish_done = Some(PublishDoneStatus::TrackEnded); }
+        }
+        // nobody resends them, else they stay in progress forever
+        // - an active race's forwarder fills those from its target on
+        let racing_from = track.race.as_ref().and_then(|r| r.active.as_ref()).map(|a| a.target);
+        if !(track.subscriptions.is_empty() && resumable) {
+            for loc in partial.into_iter().filter(|&loc| racing_from.is_none_or(|target| loc < target)) {
+                cancel_abandoned(&mut track.cache, &track.subscriptions, &mut track.stats, loc);
+            }
+        }
+        track.aliases.retain(|a| a.conn_id != cid);
+    }
+    ad.upstream_cids.remove(&cid);
+    ad.client_active_pub_tracks.remove(&cid);
 }
 
 /// Re-dials due `--reconnect`s, the time until the next one.
@@ -208,54 +215,15 @@ pub(super) fn tick_connections(r: &mut Runner) {
             continue;
         };
         conn.app_data.first_seen.get_or_insert_with(Instant::now);
-        if let Some(v) = moq.session.version() && !conn.app_data.logged_connect {
+        let state = &mut conn.app_data.state;
+        if let Some(v) = moq.session.version() && !state.logged_connect {
             let peer = moq.t.quic().path_stats().next().map(|s| s.peer_addr).unwrap();
             let verb = if is_server { "accept" } else { "connected to" };
             info!("conn {cid} {verb} {peer} v{v}");
-            conn.app_data.logged_connect = true;
+            state.logged_connect = true;
         }
-        if is_server && ad.listen_upstream && ad.upstream_cids.insert(cid) {
-            sync_sub_track_templates(ad);
-        }
-        // Serving local tracks (--pub) and relay-forwarding (passive --sub
-        // wildcards) don't depend on which side dialed the QUIC connection —
-        // a plain outbound (--connect) publisher must accept/reject incoming
-        // SUBSCRIBEs exactly like an accepted one.
-        let upstream = ad.upstream_cids.contains(&cid);
-        while let Some(event) = moq.session.next_event() {
-            if let Event::RequestFailed { request_id, failure: error } = &event {
-                conn.app_data.handles.forget(*request_id);
-                let announced = &conn.app_data.announced_namespaces;
-                if let Some((ns, _)) = announced.iter().find(|(_, a)| a.request_id() == *request_id) {
-                    // kept, so it isn't announced again
-                    info!("conn {cid} rejected namespace {ns}: {error}");
-                    continue;
-                }
-            }
-            let Some(event) = conn.app_data.responses.file(event) else { continue };
-            let handles = &mut conn.app_data.handles;
-            match event {
-                Event::Request(IncomingRequest::RequestUpdate(r)) => answer_request_update(cid, &mut moq, ad, r),
-                Event::Request(IncomingRequest::PublishNamespace(r)) => answer_publish_namespace(cid, &mut moq, ad, r, upstream),
-                Event::Request(IncomingRequest::Subscribe(r)) if upstream => reject_from_upstream(cid, &mut moq, r),
-                Event::Request(IncomingRequest::Subscribe(r)) => answer_subscribe(cid, &mut moq, handles, ad, r),
-                Event::Request(IncomingRequest::Fetch(r)) if upstream => reject_from_upstream(cid, &mut moq, r),
-                Event::Request(IncomingRequest::Fetch(r)) => ad.fetches.push(DownstreamFetch::new(cid, r)),
-                Event::Request(IncomingRequest::Publish(r)) if upstream => reject_from_upstream(cid, &mut moq, r),
-                Event::Request(IncomingRequest::Publish(r)) => answer_publish(cid, &mut moq, handles, ad, r),
-                Event::RequestCancelled(request_id) => drop_withdrawn_subscribe(cid, request_id, ad),
-                Event::NamespaceWithdrawn { namespace, .. } => forget_announcer(cid, &namespace, ad),
-                Event::Request(IncomingRequest::SubscribeNamespace(r)) => answer_subscribe_namespace(cid, &mut moq, handles, r),
-                Event::Request(IncomingRequest::SubscribeTracks(r)) => answer_subscribe_tracks(cid, &mut moq, handles, r),
-                Event::PrefixSubscriptionEnded { request_id } => handles.forget(request_id),
-                Event::Unsubscribed { request_id, track_alias } => {
-                    handles.forget(request_id);
-                    apply_unsubscribe(cid, track_alias, ad);
-                }
-                Event::SubscriptionUpdated { request_id, forward, filter } => apply_subscription_update(cid, request_id, forward, filter, ad),
-                _ => {}
-            }
-        }
+        let mut moq = moq.into();
+        drive_conn_events(cid, &mut moq, state, ad, is_server);
         // the connection's only session: its subscriptions end with it in `cleanup_closed_conns`,
         // its namespaces now, no SUBSCRIBE may be routed to it meanwhile
         if moq.session.is_closed() && !conn.conn.is_draining() {
@@ -266,13 +234,52 @@ pub(super) fn tick_connections(r: &mut Runner) {
     }
 }
 
+pub(super) fn drive_conn_events(cid: ClientId, moq: &mut MoqHandle<'_>, state: &mut ConnState, ad: &mut AppData, is_server: bool) {
+    if is_server && ad.listen_upstream && ad.upstream_cids.insert(cid) {
+        sync_sub_track_templates(ad);
+    }
+    // Like an accepted connection, a plain outbound publisher answers requests.
+    let upstream = ad.upstream_cids.contains(&cid);
+    while let Some(event) = moq.session.next_event() {
+        if let Event::RequestFailed { request_id, failure: error } = &event {
+            state.handles.forget(*request_id);
+            if let Some((ns, _)) = state.announced_namespaces.iter().find(|(_, a)| a.request_id() == *request_id) {
+                // kept, so it isn't announced again
+                info!("conn {cid} rejected namespace {ns}: {error}");
+                continue;
+            }
+        }
+        let Some(event) = state.responses.file(event) else { continue };
+        let handles = &mut state.handles;
+        match event {
+            Event::Request(IncomingRequest::RequestUpdate(r)) => answer_request_update(cid, moq, ad, r),
+            Event::Request(IncomingRequest::PublishNamespace(r)) => answer_publish_namespace(cid, moq, ad, r, upstream),
+            Event::Request(IncomingRequest::Subscribe(r)) if upstream => reject_from_upstream(cid, moq, r),
+            Event::Request(IncomingRequest::Subscribe(r)) => answer_subscribe(cid, moq, handles, ad, r),
+            Event::Request(IncomingRequest::Fetch(r)) if upstream => reject_from_upstream(cid, moq, r),
+            Event::Request(IncomingRequest::Fetch(r)) => ad.fetches.push(DownstreamFetch::new(cid, r)),
+            Event::Request(IncomingRequest::Publish(r)) if upstream => reject_from_upstream(cid, moq, r),
+            Event::Request(IncomingRequest::Publish(r)) => answer_publish(cid, moq, handles, ad, r),
+            Event::RequestCancelled(request_id) => drop_withdrawn_subscribe(cid, request_id, ad),
+            Event::NamespaceWithdrawn { namespace, .. } => forget_announcer(cid, &namespace, ad),
+            Event::Request(IncomingRequest::SubscribeNamespace(r)) => answer_subscribe_namespace(cid, moq, handles, r),
+            Event::Request(IncomingRequest::SubscribeTracks(r)) => answer_subscribe_tracks(cid, moq, handles, r),
+            Event::PrefixSubscriptionEnded { request_id } => handles.forget(request_id),
+            Event::Unsubscribed { request_id, track_alias } => {
+                handles.forget(request_id);
+                apply_unsubscribe(cid, track_alias, ad);
+            }
+            Event::SubscriptionUpdated { request_id, forward, filter } => apply_subscription_update(cid, request_id, forward, filter, ad),
+            _ => {}
+        }
+    }
+}
+
 /// Starts or stops the padding stream, sent by the next `send_padding`.
-pub(super) fn toggle_padding_streams(r: &mut Runner) {
-    let connect_only = r.endpoint.app_data().padding_stream_connect_only;
-    let (conns, _) = r.endpoint.mut_conns_and_app_data();
+pub(super) fn toggle_padding_streams(conns: &mut Connections<'_>, connect_only: bool) {
     for (_, conn) in conns.iter_mut() {
-        if connect_only && conn.conn.is_server() { continue; }
-        let Some(mut moq) = conn.app_data.moq_helper.moq_handle(&mut conn.conn) else { continue };
+        if connect_only && conn.is_server { continue; }
+        let Some(mut moq) = conn.moq else { continue };
         if moq.session.padding_stream_running() {
             moq.session.stop_padding_stream(&mut moq.t);
         } else {
@@ -286,12 +293,11 @@ pub(super) fn toggle_padding_streams(r: &mut Runner) {
 }
 
 /// PUBLISH_NAMESPACE_DONE for each of `targets` a connection announced.
-pub(super) fn withdraw_namespaces(r: &mut Runner, targets: &[Namespace]) {
-    let (conns, _) = r.endpoint.mut_conns_and_app_data();
+pub(super) fn withdraw_namespaces(conns: &mut Connections<'_>, targets: &[Namespace]) {
     for (cid, conn) in conns.iter_mut() {
-        let Some(mut moq) = conn.app_data.moq_helper.moq_handle(&mut conn.conn) else { continue };
+        let Some(mut moq) = conn.moq else { continue };
         for ns in targets {
-            if let Some(announcement) = conn.app_data.announced_namespaces.remove(ns) {
+            if let Some(announcement) = conn.state.announced_namespaces.remove(ns) {
                 moq.session.publish_namespace_done(announcement, &mut moq.t);
                 info!("conn {cid} withdrew namespace {ns}");
             }

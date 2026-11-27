@@ -13,7 +13,7 @@ use moq_object_cache::{begin_or_join, fold, put_datagram, JoinError, NewObject, 
 use signal_hook_mio::v1_0::Signals;
 use quiche_mio_runner as runner;
 use quiche_mio_runner::quiche_endpoint::{
-    ClientId, ConnMap, Endpoint, EndpointConfig, ServerConfig, make_qlog_writer, quiche,
+    ClientId, Endpoint, EndpointConfig, ServerConfig, make_qlog_writer, quiche,
 };
 use quiche_mio_runner::Socket;
 use quiche_moq as moq;
@@ -23,11 +23,11 @@ use quiche_moq::wire::{PublishDoneStatus, SessionCloseCode};
 use quiche_moq::wire::{DEFAULT_SUBSCRIBER_PRIORITY, Location, Namespace, NamespaceTrackname, RequestErrorCode, RequestId, TrackAlias};
 use quiche_moq::request::{Publish, PublishNamespace, RequestUpdate, Subscribe, SubscribeNamespace, SubscribeTracks};
 use quiche_moq::{Event, IncomingRequest, Request, RequestKind, SubscribeOk, Transport};
-use quiche_moq_webtransport_helper::{MoqHandle, MoqWebTransportHelper};
+use quiche_moq_webtransport_helper::MoqWebTransportHelper;
 use quiche_utils::cert::load_or_generate_keys;
 use quiche_utils::keepalive_handler::KeepaliveHandler;
 
-use crate::conn::{ClientActivePubTrack, ConnAppData, Handles, NamespaceSubscriber, TracksSubscriber};
+use crate::conn::{ClientActivePubTrack, ConnAppData, ConnState, Connections, Handles, MoqHandle, NamespaceSubscriber, TracksSubscriber};
 use crate::file_output::FileOutputState;
 use crate::local_track::{cancel_abandoned, FileInputState, FilterRange, LocalAliasState, LocalTrack, PendingSubscribe, RaceState, TrackStats, TrackSubscription};
 use crate::cache_to_moq::{self, CacheToMoq};
@@ -40,6 +40,7 @@ mod egress;
 mod fetch;
 mod fill;
 mod ingest;
+mod noq;
 mod requests;
 mod routing;
 mod setup;
@@ -85,14 +86,14 @@ struct SubTrackTemplate {
 }
 
 /// Ends our subscription `request_id` on `cid`, if that connection is still up.
-pub(crate) fn unsubscribe_upstream(conns: &mut ConnMap<ConnAppData>, cid: ClientId, request_id: Option<RequestId>) {
+pub(crate) fn unsubscribe_upstream(conns: &mut Connections<'_>, cid: ClientId, request_id: Option<RequestId>) {
     if let Some(request_id) = request_id
         && let Some(conn) = conns.get_mut(cid)
     {
-        conn.app_data.responses.forget(request_id);
-        let subscription = conn.app_data.handles.subscriptions.remove(&request_id);
+        conn.state.responses.forget(request_id);
+        let subscription = conn.state.handles.subscriptions.remove(&request_id);
         if let Some(subscription) = subscription
-            && let Some(mut moq) = conn.app_data.moq_helper.moq_handle(&mut conn.conn)
+            && let Some(mut moq) = conn.moq
         {
             moq.session.unsubscribe(subscription, &mut moq.t);
         }
@@ -100,14 +101,13 @@ pub(crate) fn unsubscribe_upstream(conns: &mut ConnMap<ConnAppData>, cid: Client
 }
 
 /// `cid`'s session and our handles on it, if that connection is still up.
-pub(crate) fn conn_for(conns: &mut ConnMap<ConnAppData>, cid: ClientId) -> Option<(MoqHandle<'_>, &mut Handles)> {
+pub(crate) fn conn_for<'a>(conns: &'a mut Connections<'_>, cid: ClientId) -> Option<(MoqHandle<'a>, &'a mut Handles)> {
     let conn = conns.get_mut(cid)?;
-    let moq = conn.app_data.moq_helper.moq_handle(&mut conn.conn)?;
-    Some((moq, &mut conn.app_data.handles))
+    Some((conn.moq?, &mut conn.state.handles))
 }
 /// Answers to our requests on `cid`, if that connection is still up.
-pub(crate) fn responses_for(conns: &mut ConnMap<ConnAppData>, cid: ClientId) -> Option<&mut crate::conn::Responses> {
-    Some(&mut conns.get_mut(cid)?.app_data.responses)
+pub(crate) fn responses_for<'a>(conns: &'a mut Connections<'_>, cid: ClientId) -> Option<&'a mut crate::conn::Responses> {
+    Some(&mut conns.get_mut(cid)?.state.responses)
 }
 struct AppData {
     /// `--pub` namespace/global wildcard patterns: any incoming SUBSCRIBE
@@ -164,8 +164,7 @@ struct AppData {
     /// From --prewarm: relayed upstream subscriptions deliver even if no subscriber has Forward 1.
     prewarm: bool,
     // From --unpub: withdraw (PUBLISH_NAMESPACE_DONE) these namespaces on
-    // every connection that actually announced them (see
-    // `ConnAppData::announced_namespaces`) when the `Unpub` action fires.
+    // every connection that actually announced them when the `Unpub` action fires.
     unpub_namespaces: Vec<Namespace>,
     // Owns the SIGUSR1/SIGUSR2 sources so on_file_event can drain them when
     // USR1_EVENT/USR2_EVENT fires. Registered via the non-owning
@@ -237,51 +236,58 @@ fn post_handle_recvs(r: &mut Runner) {
     }
     // `set_app_timeout` overwrites, so everything waking the loop is folded into one
     let mut app_timeout = connection_timeouts(r);
-    let actions = take_signal_actions(r);
+    let actions = take_signal_actions(r.endpoint.app_data_mut());
     if actions.contains(&SigAction::Migrate) { migrate_client_connections(r); }
     if actions.contains(&SigAction::Ping) { ping_all(r); }
     let now = Instant::now();
     cleanup_closed_conns(r, now);
     if let Some(next) = redial(r, now) { app_timeout = earlier(app_timeout, next); }
-    let race_deadlines = r.endpoint.app_data().local_tracks.values()
+    tick_connections(r);
+    let (conns, ad) = r.endpoint.mut_conns_and_app_data();
+    if let Some(next) = drive_node(&mut Connections::Quiche(conns), ad, &actions, now) {
+        app_timeout = earlier(app_timeout, next);
+    }
+    if let Some(t) = app_timeout { r.set_app_timeout(t); }
+}
+
+fn drive_node(conns: &mut Connections<'_>, ad: &mut AppData, actions: &HashSet<SigAction>, now: Instant) -> Option<Duration> {
+    let mut app_timeout = None;
+    let race_deadlines = ad.local_tracks.values()
         .filter_map(|t| t.race.as_ref()?.active.as_ref()?.deadline);
-    let fill_deadlines = r.endpoint.app_data().local_tracks.values()
+    let fill_deadlines = ad.local_tracks.values()
         .flat_map(|t| t.fill.fetches.iter().map(|f| f.deadline));
     for deadline in race_deadlines.chain(fill_deadlines) {
         app_timeout = earlier(app_timeout, deadline.saturating_duration_since(now));
     }
 
-    tick_connections(r);
     // after the tick: its announcements and PUBLISHes are sources, its SUBSCRIBEs may wait
-    if let Some(next) = drive_rendezvous(r, now) { app_timeout = earlier(app_timeout, next); }
-    if let Some(t) = app_timeout { r.set_app_timeout(t); }
-    announce_namespaces(r);
-    sync_namespace_subscribers(r);
-    sync_tracks_subscribers(r);
-    send_active_publishes(r);
-    sync_relayed_forward(r);
-    drive_tracks(r);
-    drive_fetches(r);
-    drive_races(r, actions.contains(&SigAction::RaceProbe));
-    finalize_publish_done(r);
-    if actions.contains(&SigAction::TogglePaddingStream) { toggle_padding_streams(r); }
+    if let Some(next) = drive_rendezvous(conns, ad, now) { app_timeout = earlier(app_timeout, next); }
+    announce_namespaces(conns, ad);
+    sync_namespace_subscribers(conns, ad);
+    sync_tracks_subscribers(conns, ad);
+    send_active_publishes(conns, ad);
+    sync_relayed_forward(conns, ad);
+    drive_tracks(conns, ad);
+    drive_fetches(conns, ad);
+    drive_races(conns, ad, actions.contains(&SigAction::RaceProbe));
+    finalize_publish_done(conns, ad);
+    if actions.contains(&SigAction::TogglePaddingStream) { toggle_padding_streams(conns, ad.padding_stream_connect_only); }
     if actions.contains(&SigAction::Unpub) {
-        let targets = r.endpoint.app_data().unpub_namespaces.clone();
-        withdraw_namespaces(r, &targets);
+        withdraw_namespaces(conns, &ad.unpub_namespaces);
     }
-    for_each_moq_handle(&mut r.endpoint, |moq, _| {
-        moq.session.send_padding(&mut moq.t);
-    });
+    for (_, conn) in conns.iter_mut() {
+        if let Some(mut moq) = conn.moq { moq.session.send_padding(&mut moq.t); }
+    }
     #[cfg(test)]
-    publish_status(r.endpoint.app_data());
+    publish_status(ad);
+    app_timeout
 }
 
 /// Pulls objects in from each track's subscriptions into its cache and
 /// forwards them to its subscribers, until nothing progresses: a backlog
 /// drains within the tick.
-fn drive_tracks(r: &mut Runner) {
+fn drive_tracks(conns: &mut Connections<'_>, ad: &mut AppData) {
     loop {
-        let (conns, ad) = r.endpoint.mut_conns_and_app_data();
         let mut any_progress = false;
         for (nt, track) in ad.local_tracks.iter_mut() {
             let (progress, race_winner) = drive_track_subscriptions(nt, track, conns);
@@ -298,8 +304,7 @@ fn drive_tracks(r: &mut Runner) {
 }
 
 /// `#race` bookkeeping, driven by its own I/O: once per tick, not in the `drive_tracks` loop.
-fn drive_races(r: &mut Runner, race_probe: bool) {
-    let (conns, ad) = r.endpoint.mut_conns_and_app_data();
+fn drive_races(conns: &mut Connections<'_>, ad: &mut AppData, race_probe: bool) {
     for (nt, track) in ad.local_tracks.iter_mut() {
         replace_lost_leader(nt, track, conns);
         ensure_race_candidates_established(nt, track, conns);
@@ -308,26 +313,12 @@ fn drive_races(r: &mut Runner, race_probe: bool) {
     }
 }
 
-/// run f for every moq_handle
-fn for_each_moq_handle<F>(e: &mut Endpoint<ConnAppData, AppData>, mut f: F)
-where 
-    F: FnMut(&mut MoqHandle, &mut AppData)
-{
-    let (conns, app_data) = e.mut_conns_and_app_data();
-    for (_, conn) in conns {
-        let Some(mut moq) = conn.app_data.moq_helper.moq_handle(&mut conn.conn) else { continue };
-        f(&mut moq, app_data);
-    }
-     
-}
-
 /// Looks up `cid`'s MoQ session handle, if the connection still exists and
 /// has completed its WebTransport/MoQ session setup. The single-call
 /// replacement for the `conns.get_mut(cid)` + `moq_helper.moq_handle(...)`
 /// pair repeated throughout the relay/forwarding code below.
-pub(crate) fn moq_handle_for(conns: &mut ConnMap<ConnAppData>, cid: ClientId) -> Option<MoqHandle<'_>> {
-    let conn = conns.get_mut(cid)?;
-    conn.app_data.moq_helper.moq_handle(&mut conn.conn)
+pub(crate) fn moq_handle_for<'a>(conns: &'a mut Connections<'_>, cid: ClientId) -> Option<MoqHandle<'a>> {
+    conns.get_mut(cid)?.moq
 }
 
 #[cfg(test)]

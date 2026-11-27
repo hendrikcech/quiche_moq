@@ -1,4 +1,6 @@
 use super::*;
+use crate::conn::{NodeTransport, NoqConn};
+use log::debug;
 use moq_core_async::AsyncTransport;
 use moq_noq::web_transport_noq::noq::rustls::pki_types::PrivatePkcs8KeyDer;
 use moq_noq::web_transport_noq::{ClientBuilder, Request, Server, ServerBuilder, Session, proto};
@@ -9,25 +11,6 @@ use tokio::task::JoinSet;
 type AnyError = Box<dyn std::error::Error>;
 
 pub(super) fn run(args: Args) -> Result<(), AnyError> {
-    if args.keepalive != 0
-        || args.keepalive_no_pto_limit
-        || args.timeout != 30_000
-        || args.usr1_ping
-        || args.qlog_dir.is_some()
-        || args.ssl_key_log_file.is_some()
-        || args.listen_init_cwnd().is_some()
-        || args.connect_init_cwnd().is_some()
-        || args.listen_max_data().is_some()
-        || args.connect_max_data().is_some()
-        || args.listen_max_stream_data().is_some()
-        || args.connect_max_stream_data().is_some()
-        || args.listen_max_streams_uni().is_some()
-        || args.connect_max_streams_uni().is_some()
-        || args.listen_max_streams_bidi().is_some()
-        || args.connect_max_streams_bidi().is_some()
-    {
-        return Err("--backend noq does not support quiche transport tuning, keylog, qlog or QUIC ping flags".into());
-    }
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
@@ -37,20 +20,20 @@ pub(super) fn run(args: Args) -> Result<(), AnyError> {
 async fn run_async(args: Args) -> Result<(), AnyError> {
     let cfg = make_moq_config(&args);
     // Validate before opening sockets or accepting peers.
-    MoqTransportSession::accept(cfg.clone())
+    let _: moq_core::MoqTransportSession = moq_core::MoqTransportSession::accept(cfg.clone())
         .map_err(|e| format!("invalid MoQ configuration: {e:?}"))?;
     let protocol = match cfg.version_negotiation {
         moq::VersionNegotiation::Pinned(v) => {
-            Some(moq_wire::alpn_protocol_string(v).ok_or("invalid pinned draft")?)
+            Some(v.alpn_protocol().ok_or("invalid pinned draft")?)
         }
         moq::VersionNegotiation::InBand { .. } => None,
     };
     let (mut ad, _, _) = build_app_data(&args);
-    let mut server = if let Some(port) = args.listen {
+    let mut server = if let Some(listen) = &args.listen {
         let (cert, key) = load_or_generate_keys(&args.cert, &args.key);
         let key = PrivatePkcs8KeyDer::from(key.private_key_to_der_pkcs8()?);
         let server = ServerBuilder::new()
-            .with_addr(([0, 0, 0, 0], port).into())
+            .with_addr(([0, 0, 0, 0], listen.port).into())
             .with_certificate(vec![cert.to_der()?.into()], key.into())?;
         info!("listening on {}", server.local_addr()?);
         Some(server)
@@ -68,25 +51,22 @@ async fn run_async(args: Args) -> Result<(), AnyError> {
         };
         for target in &args.connect {
             let mut request = proto::ConnectRequest::new(Url::parse(&target.url)?);
-            if request.url.scheme() != "https" {
-                return Err("--backend noq requires an https:// WebTransport URL".into());
-            }
             if let Some(protocol) = &protocol {
                 request = request.with_protocol(protocol.clone());
             }
             let cid = next_id;
             next_id += 1;
-            register_outbound(&mut ad, cid, target);
+            let upstream = target.upstream;
             let client = client.clone();
-            connects.spawn(async move { (cid, client.connect(request).await) });
+            connects.spawn(async move { (cid, upstream, client.connect(request).await) });
         }
     }
 
-    let mut conns = Connections::<MoqTransportSession, NoqTransport, ConnState>::new();
+    let mut conns = HashMap::new();
     let mut interrupt = signal(SignalKind::interrupt())?;
     let mut terminate = signal(SignalKind::terminate())?;
     let mut usr1 = signal(SignalKind::user_defined1())?;
-    let mut usr1_requested = false;
+    let mut usr2 = signal(SignalKind::user_defined2())?;
     // shortcut: poll nonblocking file I/O and MoQ together, switch to readiness for larger experiments.
     let mut ticker = tokio::time::interval(Duration::from_millis(5));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -94,14 +74,19 @@ async fn run_async(args: Args) -> Result<(), AnyError> {
         tokio::select! {
             _ = interrupt.recv() => break,
             _ = terminate.recv() => break,
-            _ = usr1.recv() => usr1_requested = true,
+            _ = usr1.recv() => ad.usr1_requested = true,
+            _ = usr2.recv() => ad.usr2_requested = true,
             Some(result) = connects.join_next() => {
-                let (cid, result) = result?;
+                let (cid, upstream, result) = result?;
                 let session = result?;
                 if session.protocol() != protocol.as_deref() {
                     return Err("peer did not negotiate the configured MoQ WebTransport protocol".into());
                 }
                 conns.insert(cid, make_connection(session, false, cfg.clone())?);
+                if upstream {
+                    ad.upstream_cids.insert(cid);
+                    sync_sub_track_templates(&mut ad);
+                }
             }
             Some(request) = accept(&mut server) => {
                 match tokio::time::timeout(Duration::from_secs(1), respond(request, protocol.as_deref())).await {
@@ -115,6 +100,7 @@ async fn run_async(args: Args) -> Result<(), AnyError> {
                 }
             }
             _ = ticker.tick() => {
+                let now = Instant::now();
                 for input in &mut ad.file_inputs {
                     if let Some(local) = ad.local_tracks.get_mut(&input.track) {
                         input.drain_into(local, ad.embed_timestamps);
@@ -132,25 +118,30 @@ async fn run_async(args: Args) -> Result<(), AnyError> {
                         continue;
                     }
                     let readable = conn.transport.readable_stream_ids();
-                    conn.session.handle(&mut conn.transport, &readable);
+                    conn.session.handle(&mut conn.transport, &readable, moq_core::Timestamp::now());
+                    if conn.session.is_closed() {
+                        closed.push(cid);
+                        continue;
+                    }
                     if let Some(v) = conn.session.version() && !conn.state.logged_connect {
-                        info!("conn {cid} noq WebTransport established v{}", version_to_name(v));
+                        info!("conn {cid} noq WebTransport established v{v}");
                         conn.state.logged_connect = true;
                     }
+                    let mut moq = MoqHandle { session: &mut conn.session, t: NodeTransport::Noq(&mut conn.transport) };
+                    drive_conn_events(cid, &mut moq, &mut conn.state, &mut ad, conn.is_server);
                 }
                 for cid in closed {
                     conns.remove(&cid);
-                    disconnect(&mut ad, cid);
+                    disconnect(cid, &mut ad, false);
                 }
-                let toggle = usr1_requested && args.usr1_toggle_padding_stream;
-                let unpub = if usr1_requested { args.usr1_unpub.as_slice() } else { &[] };
-                usr1_requested = false;
-                tick(&mut conns, &mut ad, toggle, unpub);
+                let actions = take_signal_actions(&mut ad);
+                drive_node(&mut Connections::Noq(&mut conns), &mut ad, &actions, now);
             }
         }
     }
+    log_track_stats(&ad);
     for conn in conns.values_mut() {
-        conn.transport.close_session(moq_wire::NO_ERROR.into(), "");
+        conn.transport.close_session(SessionCloseCode::NoError, "");
     }
     Ok(())
 }
@@ -183,15 +174,15 @@ fn make_connection(
     session: Session,
     is_server: bool,
     cfg: moq::Config,
-) -> Result<Connection<MoqTransportSession, NoqTransport, ConnState>, String> {
+) -> Result<NoqConn, String> {
     let (mut transport, _) = NoqTransport::new(ConnectParams::new(session, is_server));
     let session = if is_server {
-        MoqTransportSession::accept(cfg)
+        moq_core::MoqTransportSession::accept(cfg)
     } else {
-        MoqTransportSession::connect(&mut transport, cfg)
+        moq_core::MoqTransportSession::connect(&mut transport, cfg)
     }
     .map_err(|e| format!("failed to initialize MoQ: {e:?}"))?;
-    Ok(Connection {
+    Ok(NoqConn {
         session,
         transport,
         state: ConnState::default(),

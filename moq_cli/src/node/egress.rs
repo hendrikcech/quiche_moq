@@ -4,8 +4,7 @@ use super::*;
 
 /// PUBLISH_DONE to the subscribers of tracks that lost all their
 /// subscriptions, and drops relayed tracks nobody wants.
-pub(super) fn finalize_publish_done(r: &mut Runner) {
-    let (conns, ad) = r.endpoint.mut_conns_and_app_data();
+pub(super) fn finalize_publish_done(conns: &mut Connections<'_>, ad: &mut AppData) {
     for track in ad.local_tracks.values_mut() {
         // what is still fetched is forwarded first
         if track.fill.running() { continue; }
@@ -46,7 +45,7 @@ pub(super) fn finalize_publish_done(r: &mut Runner) {
 /// - one pass per priority in use (256-bit set), no allocation
 pub(super) fn forward_local_tracks(
     tracks: &mut HashMap<NamespaceTrackname, LocalTrack>,
-    conns: &mut ConnMap<ConnAppData>,
+    conns: &mut Connections<'_>,
 ) -> bool {
     let mut present = [0u64; 4];
     for track in tracks.values() {
@@ -76,7 +75,7 @@ pub(super) fn forward_local_tracks(
 pub(super) fn forward_local_alias(
     cache: &PackedObjectCache,
     als: &mut LocalAliasState,
-    conns: &mut ConnMap<ConnAppData>,
+    conns: &mut Connections<'_>,
 ) -> bool {
     let Some(mut moq) = moq_handle_for(conns, als.conn_id) else {
         als.state.needs_reset.clear();

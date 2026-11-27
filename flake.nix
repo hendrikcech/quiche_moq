@@ -84,8 +84,8 @@
                 ./logo.svg
                 ./flake.nix
                 ./flake.lock
-                  ./experiments
-                  ./moq_cli/nixnet
+                ./experiments
+                ./moq_cli/nixnet
               ]
             );
           };

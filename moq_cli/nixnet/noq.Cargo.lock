@@ -810,7 +810,7 @@ dependencies = [
 [[package]]
 name = "datagram-socket"
 version = "0.8.0"
-source = "git+https://github.com/birneee/quiche?branch=webtransport_streams_fix-2452#9635bd60a65f541e8774687cca1a9110e462fcea"
+source = "git+https://github.com/birneee/quiche.git?branch=moq-combined#91f6b8c77cad183fc4f905b6003e9a409b1a14f6"
 dependencies = [
  "bytes",
  "futures-util",
@@ -2092,7 +2092,6 @@ name = "moq-cli"
 version = "0.1.0"
 dependencies = [
  "boring",
- "bytes",
  "clap",
  "env_logger",
  "libc",
@@ -2106,13 +2105,16 @@ dependencies = [
  "moq_pacing",
  "moq_wire",
  "partial-borrow",
+ "qlog",
  "quiche_endpoint_utils",
  "quiche_mio_runner",
  "quiche_moq",
  "quiche_moq_webtransport_helper",
  "quiche_utils",
  "rstest",
+ "rustc-hash",
  "serde_json",
+ "signal-hook-mio",
  "tempfile",
  "tokio",
  "url",
@@ -2122,11 +2124,11 @@ dependencies = [
 name = "moq_core"
 version = "0.1.0"
 dependencies = [
+ "hashbrown 0.16.1",
  "log",
  "moq_wire",
- "octets",
- "partial-borrow",
  "qlog",
+ "rstest",
  "serde_json",
  "short_buf",
  "smallvec 2.0.0-alpha.12",
@@ -2148,7 +2150,6 @@ name = "moq_loc"
 version = "0.1.0"
 dependencies = [
  "moq_wire",
- "octets",
 ]
 
 [[package]]
@@ -2217,10 +2218,14 @@ dependencies = [
 name = "moq_wire"
 version = "0.1.0"
 dependencies = [
- "octets",
+ "moq_wire_primitives",
  "rstest",
  "serde_json",
 ]
+
+[[package]]
+name = "moq_wire_primitives"
+version = "0.1.0"
 
 [[package]]
 name = "mp4"
@@ -2430,8 +2435,8 @@ dependencies = [
 
 [[package]]
 name = "octets"
-version = "0.3.5"
-source = "git+https://github.com/birneee/quiche?branch=webtransport_streams_fix-2452#9635bd60a65f541e8774687cca1a9110e462fcea"
+version = "0.3.6"
+source = "git+https://github.com/birneee/quiche.git?branch=moq-combined#91f6b8c77cad183fc4f905b6003e9a409b1a14f6"
 
 [[package]]
 name = "once_cell"
@@ -2865,7 +2870,7 @@ dependencies = [
 [[package]]
 name = "qlog"
 version = "0.18.0"
-source = "git+https://github.com/birneee/quiche?branch=webtransport_streams_fix-2452#9635bd60a65f541e8774687cca1a9110e462fcea"
+source = "git+https://github.com/birneee/quiche.git?branch=moq-combined#91f6b8c77cad183fc4f905b6003e9a409b1a14f6"
 dependencies = [
  "flate2",
  "foundations",
@@ -2893,8 +2898,8 @@ dependencies = [
 
 [[package]]
 name = "quiche"
-version = "0.29.2"
-source = "git+https://github.com/birneee/quiche?branch=webtransport_streams_fix-2452#9635bd60a65f541e8774687cca1a9110e462fcea"
+version = "0.29.3"
+source = "git+https://github.com/birneee/quiche.git?branch=moq-combined#91f6b8c77cad183fc4f905b6003e9a409b1a14f6"
 dependencies = [
  "boring",
  "bytes",
@@ -2919,7 +2924,7 @@ dependencies = [
 [[package]]
 name = "quiche_endpoint"
 version = "0.1.0"
-source = "git+https://github.com/birneee/quiche_endpoint#45aedf409b6e6af886ac884230c28d3a84741062"
+source = "git+https://github.com/birneee/quiche_endpoint#c68b161c01a73de779f6cbc7781f0b2057784cfd"
 dependencies = [
  "boring",
  "log",
@@ -2934,8 +2939,6 @@ dependencies = [
 name = "quiche_endpoint_utils"
 version = "0.1.0"
 dependencies = [
- "libc",
- "mio",
  "qlog",
  "quiche_mio_runner",
  "serde_json",
@@ -2951,7 +2954,7 @@ dependencies = [
 [[package]]
 name = "quiche_mio_runner"
 version = "0.1.0"
-source = "git+https://github.com/birneee/quiche_mio_runner#3a458aa709c303be27524c1e9cae36a6ef50d3cc"
+source = "git+https://github.com/birneee/quiche_mio_runner#1fe2bd2275fcf038058ac61e6d2a7c72fe3e3473"
 dependencies = [
  "libc",
  "log",
@@ -2968,24 +2971,13 @@ dependencies = [
  "log",
  "moq_core",
  "moq_wire",
- "octets",
  "qlog",
  "quiche",
- "quiche_moq_macros",
  "quiche_utils",
  "quiche_webtransport",
  "serde_json",
  "short_buf",
  "smallvec 2.0.0-alpha.12",
-]
-
-[[package]]
-name = "quiche_moq_macros"
-version = "0.1.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
 ]
 
 [[package]]
@@ -2995,6 +2987,7 @@ dependencies = [
  "boring",
  "env_logger",
  "log",
+ "moq_core",
  "quiche",
  "quiche_h3_utils",
  "quiche_mio_runner",
@@ -3024,6 +3017,7 @@ dependencies = [
  "octets",
  "quiche",
  "quiche_h3_utils",
+ "rustc-hash",
  "short_buf",
  "url",
 ]
@@ -3605,6 +3599,27 @@ name = "short_buf"
 version = "0.1.0"
 
 [[package]]
+name = "signal-hook"
+version = "0.3.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d881a16cf4426aa584979d30bd82cb33429027e42122b169753d6ef1085ed6e2"
+dependencies = [
+ "libc",
+ "signal-hook-registry",
+]
+
+[[package]]
+name = "signal-hook-mio"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b75a19a7a740b25bc7944bdee6172368f988763b744e3d4dfe753f6b4ece40cc"
+dependencies = [
+ "libc",
+ "mio",
+ "signal-hook",
+]
+
+[[package]]
 name = "signal-hook-registry"
 version = "1.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3840,7 +3855,7 @@ checksum = "f764005d11ee5f36500a149ace24e00e3da98b0158b3e2d53a7495660d3f4d60"
 [[package]]
 name = "task-killswitch"
 version = "0.2.1"
-source = "git+https://github.com/birneee/quiche?branch=webtransport_streams_fix-2452#9635bd60a65f541e8774687cca1a9110e462fcea"
+source = "git+https://github.com/birneee/quiche.git?branch=moq-combined#91f6b8c77cad183fc4f905b6003e9a409b1a14f6"
 dependencies = [
  "dashmap",
  "parking_lot",
@@ -4048,8 +4063,8 @@ dependencies = [
 
 [[package]]
 name = "tokio-quiche"
-version = "0.19.0"
-source = "git+https://github.com/birneee/quiche?branch=webtransport_streams_fix-2452#9635bd60a65f541e8774687cca1a9110e462fcea"
+version = "0.19.1"
+source = "git+https://github.com/birneee/quiche.git?branch=moq-combined#91f6b8c77cad183fc4f905b6003e9a409b1a14f6"
 dependencies = [
  "anyhow",
  "boring",

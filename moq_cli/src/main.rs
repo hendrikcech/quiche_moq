@@ -6,5 +6,8 @@ fn main() {
     if let Err(e) = args.validate() {
         moq_cli::Args::command().error(clap::error::ErrorKind::ArgumentConflict, e).exit();
     }
-    moq_cli::node::run(args);
+    if let Err(error) = moq_cli::node::run(args) {
+        log::error!("{error}");
+        std::process::exit(1);
+    }
 }

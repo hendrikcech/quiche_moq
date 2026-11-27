@@ -2,9 +2,13 @@
 
 use super::*;
 
-pub fn run(args: Args) {
+pub fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+    if args.backend == crate::args::Backend::Noq {
+        return noq::run(args);
+    }
     let r = build_runner(&args);
     finish_run(r);
+    Ok(())
 }
 
 /// What the arguments set up before any connection: tracks, namespaces,
@@ -96,41 +100,13 @@ pub(super) fn setup_from_args(args: &Args) -> ArgSetup {
     }
 }
 
-pub(super) fn build_runner(args: &Args) -> Runner {
-    let server_socket = args.listen.as_ref().map(|l| Socket::bind(format!("0.0.0.0:{}", l.port)).unwrap());
-    let client_socket = server_socket.is_none().then(|| Socket::bind("0.0.0.0:0").unwrap());
-    let local_addr = server_socket.as_ref().or(client_socket.as_ref()).unwrap().local_addr;
-
-    if let Some(l) = &args.listen { info!("listening on 0.0.0.0:{}", l.port); }
-
+pub(super) fn build_app_data(args: &Args) -> (AppData, Vec<RawFd>, Vec<RawFd>) {
     let ArgSetup {
         local_tracks, local_namespaces, active_pub_tracks, file_inputs, file_input_fds, file_output_fds,
         pub_passive_wildcards, sub_passive_wildcards,
     } = setup_from_args(args);
 
-    let endpoint = Endpoint::new(
-        args.listen.as_ref().map(|_| {
-            let (cert, key) = load_or_generate_keys(&args.cert, &args.key);
-            let moq_cfg = make_moq_config(args);
-            let native = args.listen.as_ref().is_some_and(|l| l.native);
-            let mut quic_cfg = quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, {
-                let mut b = SslContextBuilder::new(SslMethod::tls()).unwrap();
-                b.set_private_key(&key).unwrap();
-                b.set_certificate(&cert).unwrap();
-                b
-            }).unwrap();
-            configure_quic(&mut quic_cfg, args, args.listen_quic());
-            MoqWebTransportHelper::set_application_protos(&mut quic_cfg, &moq_cfg, true, native)
-                .unwrap_or_else(|e| panic!("--listen: {e}, see --setup-version"));
-            let mut c = ServerConfig::new(move |_| {
-                let helper = MoqWebTransportHelper::new_server(moq_cfg.clone());
-                ConnAppData::new(if native { helper.with_native_quic() } else { helper }, None)
-            });
-            c.client_config = quic_cfg;
-            c.drop_new_paths = args.no_migration;
-            c
-        }),
-        EndpointConfig { setup_qlog, ..EndpointConfig::default() },
+    (
         AppData {
             pub_passive_wildcards,
             sub_passive_wildcards,
@@ -164,11 +140,49 @@ pub(super) fn build_runner(args: &Args) -> Runner {
             embed_timestamps: args.timestamp,
             qlog_dir: args.qlog_dir.clone(),
             qlog_level: args.qlog_level,
-            reconnect: args.reconnect.then(|| (args.clone(), local_addr)),
+            reconnect: None,
             pending_reconnects: Vec::new(),
             #[cfg(test)]
             status: Default::default(),
         },
+        file_input_fds,
+        file_output_fds,
+    )
+}
+
+pub(super) fn build_runner(args: &Args) -> Runner {
+    let server_socket = args.listen.as_ref().map(|l| Socket::bind(format!("0.0.0.0:{}", l.port)).unwrap());
+    let client_socket = server_socket.is_none().then(|| Socket::bind("0.0.0.0:0").unwrap());
+    let local_addr = server_socket.as_ref().or(client_socket.as_ref()).unwrap().local_addr;
+
+    if let Some(l) = &args.listen { info!("listening on 0.0.0.0:{}", l.port); }
+
+    let (mut ad, file_input_fds, file_output_fds) = build_app_data(args);
+    ad.reconnect = args.reconnect.then(|| (args.clone(), local_addr));
+    let endpoint = Endpoint::new(
+        args.listen.as_ref().map(|_| {
+            let (cert, key) = load_or_generate_keys(&args.cert, &args.key);
+            let moq_cfg = make_moq_config(args);
+            let native = args.listen.as_ref().is_some_and(|l| l.native);
+            let mut quic_cfg = quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, {
+                let mut b = SslContextBuilder::new(SslMethod::tls()).unwrap();
+                b.set_private_key(&key).unwrap();
+                b.set_certificate(&cert).unwrap();
+                b
+            }).unwrap();
+            configure_quic(&mut quic_cfg, args, args.listen_quic());
+            MoqWebTransportHelper::set_application_protos(&mut quic_cfg, &moq_cfg, true, native)
+                .unwrap_or_else(|e| panic!("--listen: {e}, see --setup-version"));
+            let mut c = ServerConfig::new(move |_| {
+                let helper = MoqWebTransportHelper::new_server(moq_cfg.clone());
+                ConnAppData::new(if native { helper.with_native_quic() } else { helper }, None)
+            });
+            c.client_config = quic_cfg;
+            c.drop_new_paths = args.no_migration;
+            c
+        }),
+        EndpointConfig { setup_qlog, ..EndpointConfig::default() },
+        ad,
     );
 
     let mut r = Runner::new(

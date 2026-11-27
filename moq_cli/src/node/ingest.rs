@@ -11,7 +11,7 @@ use super::*;
 /// - Drops a subscription that ends (rejected, `PUBLISH_DONE`, malformed
 ///   track); if that empties `track.subscriptions`, marks every
 ///   `LocalAliasState` `gone` for the finalize pass to `PUBLISH_DONE`.
-pub(super) fn drive_track_subscriptions(nt: &NamespaceTrackname, track: &mut LocalTrack, conns: &mut ConnMap<ConnAppData>) -> (bool, Option<ClientId>) {
+pub(super) fn drive_track_subscriptions(nt: &NamespaceTrackname, track: &mut LocalTrack, conns: &mut Connections<'_>) -> (bool, Option<ClientId>) {
     if track.subscriptions.is_empty() { return (false, None); }
     let mut progress = false;
     // Set the moment any subscription racing for `nt` (the incumbent leader

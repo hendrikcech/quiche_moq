@@ -2,7 +2,10 @@
 //! the synchronous MoQ core. All actual transport I/O runs on Tokio tasks.
 
 use bytes::{Buf, Bytes};
-use moq_core::{Transport, transport::StreamError};
+use moq_core::{
+    SharedDropQueue, StreamError, Transport,
+    wire::{ResetCode, SessionCloseCode},
+};
 use moq_core_async::{AsyncTransport, Notify};
 use std::{
     collections::{HashMap, VecDeque},
@@ -50,6 +53,7 @@ struct SendState {
     offset: usize,
     bytes: usize,
     fin: bool,
+    fin_acked: bool,
     reset: Option<u32>,
     priority: i32,
     done: bool,
@@ -96,6 +100,17 @@ struct State {
     stopped: VecDeque<(u64, u64)>,
 }
 impl State {
+    fn stopped_code(&self, id: u64) -> Option<u64> {
+        match self.streams.get(&id) {
+            Some(st) => st.send.as_ref().and_then(|send| send.stopped),
+            None => self
+                .stopped
+                .iter()
+                .find(|(sid, _)| *sid == id)
+                .map(|(_, code)| *code),
+        }
+    }
+
     fn retire_if_finished(&mut self, id: u64) {
         // A receive terminal stays visible until it is read or explicitly discarded.
         let finished = self.streams.get(&id).is_some_and(|st| {
@@ -261,7 +276,7 @@ where
 
     fn open(&self, bidi: bool) -> Result<u64, StreamError> {
         if self.shared.state.lock().unwrap().error.is_some() {
-            return Err(StreamError::Done);
+            return Err(StreamError::Failed);
         }
         let kind = self.local_kind | if bidi { 0 } else { 2 };
         let (id, sw, rw) = self.shared.allocate(kind, true, bidi);
@@ -325,15 +340,13 @@ where
     ) -> Result<usize, StreamError> {
         let mut s = self.shared.state.lock().unwrap();
         if s.error.is_some() {
-            return Err(full);
+            return Err(StreamError::Failed);
         }
         let remaining = self.shared.total.saturating_sub(s.queued);
         let Some(stream) = s.streams.get_mut(&id) else {
             return Err(s
-                .stopped
-                .iter()
-                .find(|(sid, _)| *sid == id)
-                .map(|(_, code)| StreamError::StreamStopped(*code))
+                .stopped_code(id)
+                .map(StreamError::StreamStopped)
                 .unwrap_or(StreamError::InvalidStreamState(id)));
         };
         let send = stream
@@ -370,12 +383,6 @@ impl<S: Session> Drop for WebTransport<S> {
     }
 }
 
-// QUIC's application error space is larger than WebTransport's. Never
-// silently truncate; use a generic code when the requested code cannot fit.
-fn wt_code(code: u64) -> u32 {
-    u32::try_from(code).unwrap_or(0)
-}
-
 impl<S> Transport for WebTransport<S>
 where
     S: Session + Send + Sync,
@@ -385,7 +392,7 @@ where
     fn recv_stream(&mut self, id: u64, dst: &mut [u8]) -> Result<usize, StreamError> {
         let mut s = self.shared.state.lock().unwrap();
         if s.error.is_some() {
-            return Err(StreamError::Done);
+            return Err(StreamError::Failed);
         }
         let stream = s
             .streams
@@ -440,31 +447,44 @@ where
             st.send_wake.notify_one();
         }
     }
-    fn reset_stream(&mut self, id: u64, code: u64) {
+    fn reset_stream(&mut self, id: u64, code: ResetCode) {
         let mut s = self.shared.state.lock().unwrap();
         if let Some(st) = s.streams.get_mut(&id)
             && let Some(send) = st.send.as_mut()
         {
-            send.reset = Some(wt_code(code));
+            send.reset = Some(code.to_u32());
             st.send_wake.notify_one();
         }
     }
-    fn stop_sending(&mut self, id: u64, code: u64) {
+    fn stop_sending(&mut self, id: u64, code: ResetCode) -> bool {
         let mut s = self.shared.state.lock().unwrap();
         if let Some(st) = s.streams.get_mut(&id)
             && let Some(recv) = st.recv.as_mut()
         {
-            recv.stop = Some(wt_code(code));
+            recv.stop = Some(code.to_u32());
             recv.chunk = Bytes::new();
             recv.retired = true;
             st.recv_wake.notify_one();
             s.retire_if_finished(id);
         }
+        true
     }
-    fn close_session(&mut self, code: u64, reason: &str) {
+    fn stream_stopped(&mut self, id: u64) -> bool {
+        self.shared.state.lock().unwrap().stopped_code(id).is_some()
+    }
+    fn stream_finished(&self, id: u64) -> bool {
+        self.shared
+            .state
+            .lock()
+            .unwrap()
+            .streams
+            .get(&id)
+            .is_none_or(|st| st.send.as_ref().is_some_and(|send| send.fin_acked))
+    }
+    fn close_session(&mut self, code: SessionCloseCode, reason: &str) {
         if !self.closed {
             self.closed = true;
-            self.session.close(wt_code(code), reason);
+            self.session.close(code.into(), reason);
             self.shared.fail(reason);
         }
     }
@@ -477,6 +497,7 @@ where
     S::RecvStream: Send + 'static,
 {
     type FlushError = ConnectionError;
+    type DropQueue = SharedDropQueue;
     type ConnectParams = ConnectParams<S>;
     type ConnectError = std::convert::Infallible;
     async fn connect(params: Self::ConnectParams) -> Result<(Self, Notify), Self::ConnectError> {
@@ -521,6 +542,7 @@ async fn send_worker<T: SendStream + Send + 'static>(
     }
     let mut cancel = shared.cancel.subscribe();
     let mut finished = false;
+    let mut fin_acked = false;
     let mut last_priority = None;
     let error = loop {
         let (priority, action) = {
@@ -593,6 +615,7 @@ async fn send_worker<T: SendStream + Send + 'static>(
                     _ = wake.notified() => continue,
                     r = stream.closed() => r,
                 };
+                fin_acked = finished && result.is_ok();
                 break result.err();
             }
         }
@@ -609,6 +632,7 @@ async fn send_worker<T: SendStream + Send + 'static>(
             let bytes = std::mem::take(&mut send.bytes);
             send.queue.clear();
             send.done = true;
+            send.fin_acked = fin_acked;
             send.stopped = stopped;
             s.queued -= bytes;
         }
@@ -760,12 +784,6 @@ mod tests {
         assert!(state.streams.contains_key(&other));
         assert_eq!(state.queued, 0);
         assert_eq!(state.stopped.front(), Some(&(id, 42)));
-    }
-
-    #[test]
-    fn oversized_codes_are_not_truncated() {
-        assert_eq!(wt_code(u32::MAX as u64), u32::MAX);
-        assert_eq!(wt_code(u32::MAX as u64 + 2), 0);
     }
 
     #[test]

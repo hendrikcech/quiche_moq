@@ -11,14 +11,6 @@ pub struct MoqHandle<'a> {
 }
 
 impl<'a> MoqHandle<'a> {
-    /// Borrow the shared MoQ state and its quiche transport for application work.
-    pub fn into_core(self) -> (&'a mut moq_core::MoqTransportSession, crate::QuicheTransport<'a>) {
-        let transport = crate::QuicheTransport::new(
-            self.session.webtransport_session_id.into(), self.wt, self.h3, self.quic,
-        );
-        (&mut self.session.inner, transport)
-    }
-
     pub fn new(
         session: &'a mut MoqTransportSession,
         quic: &'a mut quiche::Connection,

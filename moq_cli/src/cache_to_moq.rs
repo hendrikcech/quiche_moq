@@ -16,7 +16,7 @@ use log::{debug, error};
 use moq_object_cache::{CachedObjectRef, ObjectCache, ObjectState};
 
 use quiche_moq::wire::{Location, ResetCode, TrackAlias};
-use quiche_moq_webtransport_helper::MoqHandle;
+use crate::conn::MoqHandle;
 use crate::local_track::FilterRange;
 
 /// `Location`-keyed sets/maps on the per-tick hot path (`forward` rescans
@@ -409,12 +409,12 @@ mod tests {
         let mut state = CacheToMoq::new();
 
         // Empty cache: nothing to send, but this establishes last_scanned_generation.
-        let progress = forward(&cache, &mut state, &mut p.server(), track_alias, "test");
+        let progress = forward(&cache, &mut state, &mut p.server().into(), track_alias, "test");
         assert!(!progress);
         assert_eq!(state.last_scanned_generation, Some(0));
 
         cache.begin(NewObject { end_of_subgroup: true, ..NewObject::new(Location { group: 0, object: 0 }, 1) }).unwrap();
-        let progress = forward(&cache, &mut state, &mut p.server(), track_alias, "test");
+        let progress = forward(&cache, &mut state, &mut p.server().into(), track_alias, "test");
         assert!(progress, "a newly begun object must not be silently skipped");
         assert_eq!(state.last_scanned_generation, Some(1));
     }
@@ -432,12 +432,12 @@ mod tests {
 
         moq_object_cache::begin_or_join(&mut cache, NewObject { end_of_subgroup: true, ..NewObject::new(loc, 1) }).unwrap();
         cache.find_mut(loc).unwrap().cancel();
-        assert!(!forward(&cache, &mut state, &mut p.server(), track_alias, "test"));
+        assert!(!forward(&cache, &mut state, &mut p.server().into(), track_alias, "test"));
         assert!(!state.completed.contains(&loc));
 
         moq_object_cache::begin_or_join(&mut cache, NewObject { end_of_subgroup: true, ..NewObject::new(loc, 1) }).unwrap();
         moq_object_cache::fold(&mut cache, loc, 1, b"x");
-        assert!(forward(&cache, &mut state, &mut p.server(), track_alias, "test"));
+        assert!(forward(&cache, &mut state, &mut p.server().into(), track_alias, "test"));
         assert!(state.completed.contains(&loc) || state.in_flight.contains(&loc));
     }
 
@@ -475,7 +475,7 @@ mod tests {
             cache.begin(NewObject { end_of_subgroup: true, ..NewObject::new(loc, 1) }).unwrap();
         }
 
-        forward(&cache, &mut state, &mut p.server(), track_alias, "test");
+        forward(&cache, &mut state, &mut p.server().into(), track_alias, "test");
         assert!(state.in_flight.contains(&inside) || state.completed.contains(&inside));
         assert!(!state.in_flight.contains(&beyond) && !state.completed.contains(&beyond));
     }
@@ -491,14 +491,14 @@ mod tests {
         let first = Location { group: 0, object: 0 };
         cache.begin(NewObject::new(first, 1)).unwrap();
         fold(&mut cache, first, 1, b"x");
-        forward(&cache, &mut state, &mut p.server(), track_alias, "test");
+        forward(&cache, &mut state, &mut p.server().into(), track_alias, "test");
         assert!(!state.range_delivered(&cache), "group 0 may continue");
 
         let last = Location { group: 0, object: 1 };
         cache.begin(NewObject { end_of_subgroup: true, ..NewObject::new(last, 1) }).unwrap();
         assert!(!state.range_delivered(&cache), "its last object isn't forwarded");
         fold(&mut cache, last, 1, b"y");
-        while forward(&cache, &mut state, &mut p.server(), track_alias, "test") {}
+        while forward(&cache, &mut state, &mut p.server().into(), track_alias, "test") {}
         assert!(state.awaiting_fin.is_empty(), "object 1 carried the FIN");
         assert!(state.range_delivered(&cache));
     }
