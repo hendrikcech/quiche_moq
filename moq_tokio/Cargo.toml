@@ -20,6 +20,7 @@ tokio-stream = "0.1"
 url = { workspace = true }
 log = { workspace = true }
 rcgen = { workspace = true }
+tempfile = "3"
 
 [dev-dependencies]
 env_logger = { workspace = true }

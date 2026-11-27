@@ -5,6 +5,7 @@
 use crate::webtransport::{new_pair, WebTransportHandle};
 use crate::Error;
 use moq_core_async::Notify;
+use std::io::Write;
 use std::net::SocketAddr;
 use tokio::net::UdpSocket;
 use tokio_quiche::quic::connect_with_config;
@@ -40,17 +41,6 @@ pub(crate) async fn connect(addr: SocketAddr) -> Result<(WebTransportHandle, Not
 pub(crate) struct Listener {
     local_addr: SocketAddr,
     incoming: tokio_quiche::QuicConnectionStream<tokio_quiche::metrics::DefaultMetrics>,
-    _cert_dir: TempDir,
-}
-
-/// Minimal directory-cleans-itself-up helper — avoids taking on the
-/// `tempfile` crate for two files.
-struct TempDir(std::path::PathBuf);
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
 }
 
 impl Listener {
@@ -59,34 +49,29 @@ impl Listener {
         socket.set_nonblocking(true).map_err(|_| Error)?;
         let local_addr = socket.local_addr().map_err(|_| Error)?;
 
-        let dir = std::env::temp_dir().join(format!("moq_tokio-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).map_err(|_| Error)?;
-        let cert_path = dir.join("cert.pem");
-        let key_path = dir.join("key.pem");
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).map_err(|_| Error)?;
-        std::fs::write(&cert_path, cert.cert.pem()).map_err(|_| Error)?;
-        std::fs::write(&key_path, cert.key_pair.serialize_pem()).map_err(|_| Error)?;
+        let mut cert_file = tempfile::NamedTempFile::new().map_err(|_| Error)?;
+        let mut key_file = tempfile::NamedTempFile::new().map_err(|_| Error)?;
+        cert_file.write_all(cert.cert.pem().as_bytes()).map_err(|_| Error)?;
+        key_file.write_all(cert.key_pair.serialize_pem().as_bytes()).map_err(|_| Error)?;
 
         let params = ConnectionParams::new_server(
             QuicSettings::default(),
             TlsCertificatePaths {
-                cert: cert_path.to_str().ok_or(Error)?,
-                private_key: key_path.to_str().ok_or(Error)?,
+                cert: cert_file.path().to_str().ok_or(Error)?,
+                private_key: key_file.path().to_str().ok_or(Error)?,
                 kind: Default::default(),
             },
             Hooks::default(),
         );
-        // `listen`'s `params` is consumed by value per-call internally via
-        // `Config::new`, but the function signature borrows it for the
-        // duration of the call only, so this local `params` is fine to drop
-        // after — the listener doesn't need it kept alive.
+        // `listen` loads both PEM files before returning.
         let incoming = tokio_quiche::listen([socket], params, tokio_quiche::metrics::DefaultMetrics)
             .map_err(|_| Error)?
             .into_iter()
             .next()
             .ok_or(Error)?;
 
-        Ok(Self { local_addr, incoming, _cert_dir: TempDir(dir) })
+        Ok(Self { local_addr, incoming })
     }
 
     pub(crate) fn local_addr(&self) -> SocketAddr {

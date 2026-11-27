@@ -2191,6 +2191,7 @@ dependencies = [
  "quiche",
  "quiche_webtransport",
  "rcgen",
+ "tempfile",
  "tokio",
  "tokio-quiche",
  "tokio-stream",
